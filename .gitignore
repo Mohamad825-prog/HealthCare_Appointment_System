@@ -5,3 +5,4 @@ build/
 coverage/
 .vscode/
 uploads/
+backend/models/
