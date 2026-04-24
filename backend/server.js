@@ -1,4 +1,4 @@
-import express from 'express';
+import express from 'express'; 
 import cors from 'cors';
 import 'dotenv/config';
 console.log("ENV FRONTEND_URL:", process.env.FRONTEND_URL);
