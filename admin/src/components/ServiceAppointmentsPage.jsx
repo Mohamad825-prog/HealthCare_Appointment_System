@@ -701,7 +701,7 @@ const ServiceAppointmentsPage = () => {
                                                         <User className={serviceAppointmentsStyles.patientAvatarIcon} />
                                                     </div>
 
-                                                    <div>
+                                                    <div className={serviceAppointmentsStyles.patientInfo}>
                                                         <div className={serviceAppointmentsStyles.patientName}>
                                                             {a.patientName}
                                                         </div>
@@ -712,7 +712,6 @@ const ServiceAppointmentsPage = () => {
                                                 </div>
 
                                                 <div className={serviceAppointmentsStyles.statusContainer}>
-                                                    <StatusBadge status={a.status} />
                                                     <div className="mt-1">
                                                         <StatusSelect
                                                             appointment={a}
@@ -724,6 +723,10 @@ const ServiceAppointmentsPage = () => {
                                             </div>
 
                                             <div className={serviceAppointmentsStyles.detailsContainer}>
+                                                <div className={serviceAppointmentsStyles.detailStatusRow}>
+                                                    <StatusBadge status={a.status} />
+                                                </div>
+
                                                 <div className={serviceAppointmentsStyles.detailItem}>
                                                     <Phone className={serviceAppointmentsStyles.detailIcon} />
                                                     <span className={serviceAppointmentsStyles.detailText}>

@@ -767,15 +767,16 @@ export const serviceAppointmentsStyles = {
   article: "group relative rounded-3xl p-1 animated-border h-full transform transition-all duration-300 hover:-translate-y-2",
   cardInner: "card-inner rounded-2xl overflow-hidden border-2 border-emerald-300/60 p-5 bg-white/90 shadow-lg h-full flex flex-col justify-between",
 
-  cardHeader: "flex flex-col sm:flex-row sm:items-start justify-between gap-4",
-  patientInfoContainer: "flex items-start gap-4 min-w-0",
+  cardHeader: "flex flex-col md:flex-row md:items-start md:justify-between gap-4",
+  patientInfoContainer: "flex items-start gap-4 min-w-0 flex-1",
   patientAvatar: "rounded-full w-12 h-12 flex items-center justify-center bg-emerald-100/70",
   patientAvatarIcon: "h-6 w-6 text-emerald-700",
   patientInfo: "min-w-0",
-  patientName: "text-lg md:text-sm lg:text-xs xl:text-md whitespace-nowrap font-bold leading-tight text-emerald-900 w-full line-clamp-2",
+  patientName: "text-base sm:text-lg font-bold leading-tight text-emerald-900 whitespace-nowrap",
   patientDetails: "text-sm text-gray-500 mt-1",
 
-  statusContainer: "flex flex-col items-start sm:items-end gap-2 mt-2 sm:mt-0",
+  statusContainer: "flex flex-col items-end gap-2 self-end w-auto mt-8 md:mt-0 ml-auto",
+  detailStatusRow: "flex items-center justify-end md:justify-start",
 
   detailsContainer: "mt-4 flex flex-col gap-3 text-gray-700",
   detailItem: "flex items-center gap-3 text-base",
