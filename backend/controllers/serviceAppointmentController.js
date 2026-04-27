@@ -43,7 +43,7 @@ const buildFrontendBase = (req) => {
 
 function resolveClerkUserId(req) {
     try {
-        const auth = req.auth || {};
+        const auth = typeof req.auth === "function" ? req.auth() : (req.auth || {});
         const candidate = auth?.userId || auth?.user_id || auth?.user?.id || req.user?.id || null;
         if (candidate) return candidate;
         try {

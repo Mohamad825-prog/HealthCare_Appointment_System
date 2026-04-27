@@ -31,7 +31,7 @@ const buildFrontendBase = (req) => {
 // Resolve the user ID from the request, checking various properties and Clerk auth
 function resolveClerkUserId(req) {
     try {
-        const auth = req.auth || {};
+        const auth = typeof req.auth === "function" ? req.auth() : (req.auth || {});
         const fromReq = auth?.userId || auth?.user_id || auth?.user?.id || req.user?.id || null;
         if (fromReq) return fromReq;
         try {
@@ -71,7 +71,7 @@ function formatAppointment(row, doctorInfo = null) {
         paidAt: row.paid_at,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
-        notes: row.notes, // Note: original schema didn't have notes field, but we added it in the table? Actually original had notes. We'll include.
+        notes: row.notes || "",
     };
 }
 
@@ -96,7 +96,7 @@ export const getAppointments = async (req, res) => {
         if (patientClerkId) query = query.eq('created_by', patientClerkId);
         if (createdBy) query = query.eq('created_by', createdBy);
         if (search) {
-            query = query.or(`patient_name.ilike.%${search}%,mobile.ilike.%${search}%,notes.ilike.%${search}%`);
+            query = query.or(`patient_name.ilike.%${search}%,mobile.ilike.%${search}%`);
         }
 
         const { data: appointments, count, error } = await query
@@ -124,13 +124,14 @@ export const getAppointments = async (req, res) => {
 export const getAppointmentsByPatient = async (req, res) => {
     try {
         const queryCreatedBy = req.query.createdBy || null;
-        const clerkUserId = req.auth?.userId || null;
+        const clerkUserId = resolveClerkUserId(req);
         const resolvedCreatedBy = queryCreatedBy || clerkUserId || null;
 
         if (!resolvedCreatedBy && !req.query.mobile) {
-            return res.status(401).json({
-                success: false,
-                message: "Unauthorized: No patient identifier provided."
+            return res.json({
+                success: true,
+                appointments: [],
+                data: []
             });
         }
 
@@ -147,7 +148,7 @@ export const getAppointmentsByPatient = async (req, res) => {
         if (error) throw error;
 
         const formatted = appointments.map(apt => formatAppointment(apt, apt.doctor));
-        return res.json({ success: true, appointments: formatted });
+        return res.json({ success: true, appointments: formatted, data: formatted });
     } catch (err) {
         console.error("Get Appointments By Patient Error:", err);
         return res.status(500).json({
@@ -223,7 +224,7 @@ export const createAppointment = async (req, res) => {
         let doctor = null;
         const { data: doctorData, error: doctorError } = await supabase
             .from('doctors')
-            .select('id, name, specialization, image_url, image_public_id, owner, fee')
+            .select('id, name, specialization, image_url, image_public_id, fee')
             .eq('id', doctorId)
             .maybeSingle();
 
@@ -236,7 +237,7 @@ export const createAppointment = async (req, res) => {
         });
 
         // Resolve owner, names, images, etc.
-        let resolvedOwner = ownerFromBody || doctor.owner || null;
+        let resolvedOwner = ownerFromBody || null;
         if (!resolvedOwner) resolvedOwner = MAJOR_ADMIN_ID || String(doctorId);
 
         const doctorName = (doctor.name && String(doctor.name).trim()) || (doctorNameFromBody && String(doctorNameFromBody).trim()) || "";
@@ -260,7 +261,6 @@ export const createAppointment = async (req, res) => {
             fees: numericFee,
             status: "Pending",
             payment: { method: paymentMethod === "Cash" ? "Cash" : "Online", status: "Pending", amount: numericFee },
-            notes: notes || "",
             created_by: clerkUserId,
             owner: resolvedOwner,
             session_id: null,
@@ -491,7 +491,6 @@ export const updateAppointment = async (req, res) => {
 
         const updates = {};
         if (body.status) updates.status = body.status;
-        if (body.notes !== undefined) updates.notes = body.notes;
 
         if (body.date && body.time) {
             if (appt.status === "Completed" || appt.status === "Canceled") {
@@ -612,13 +611,13 @@ export const getAppointmentsByDoctor = async (req, res) => {
 
         let query = supabase.from('appointments').select(`
             *,
-            doctor:doctor_id ( id, name, specialization, owner, image_url, image )
+            doctor:doctor_id ( id, name, specialization, image_url, image )
         `, { count: 'exact' }).eq('doctor_id', doctorId);
 
         if (mobile) query = query.eq('mobile', mobile);
         if (status) query = query.eq('status', status);
         if (search) {
-            query = query.or(`patient_name.ilike.%${search}%,mobile.ilike.%${search}%,notes.ilike.%${search}%`);
+            query = query.or(`patient_name.ilike.%${search}%,mobile.ilike.%${search}%`);
         }
 
         const { data: appointments, count, error } = await query
