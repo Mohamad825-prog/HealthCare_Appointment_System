@@ -540,7 +540,7 @@ export const cancelServiceAppointment = async (req, res) => {
         if (appt.status === "Completed") return res.status(400).json({ success: false, message: "Cannot cancel a completed appointment" });
 
         const newPayment = { ...appt.payment };
-        newPayment.status = newPayment.status === "Confirmed" ? "Canceled" : "Pending";
+        newPayment.status = newPayment.status === "Paid" ? "Refunded" : "Canceled";
 
         const { data: updated, error: updateError } = await supabase
             .from('service_appointments')

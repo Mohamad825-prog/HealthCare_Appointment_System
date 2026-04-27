@@ -127,8 +127,6 @@ export const getAppointmentsByPatient = async (req, res) => {
         const clerkUserId = req.auth?.userId || null;
         const resolvedCreatedBy = queryCreatedBy || clerkUserId || null;
 
-        console.log("resolvedCreatedBy (query or req.auth.userId):", resolvedCreatedBy);
-
         if (!resolvedCreatedBy && !req.query.mobile) {
             return res.status(401).json({
                 success: false,

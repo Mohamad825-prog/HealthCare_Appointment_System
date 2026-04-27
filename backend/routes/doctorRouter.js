@@ -1,12 +1,10 @@
 import express from "express";
-import multer from "multer";
+import upload from "../middlewares/multer.js";
 
 import { createDoctor, deleteDoctor, getDoctors, toggleAvailability, updateDoctor } from '../controllers/doctorController.js';
 import { doctorLogin, getDoctorById } from '../controllers/doctorController.js';
 
 import doctorAuth from '../middlewares/doctorAuth.js';
-
-const upload = multer({ dest: "/tmp" }); // temporary storage for uploaded files
 
 const doctorRouter = express.Router();
 
