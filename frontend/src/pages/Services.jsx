@@ -209,7 +209,7 @@ const Services = () => {
           {/* Stats row */}
           <div className="flex gap-10 sm:gap-16 justify-center flex-wrap">
             {[
-              { value: loading ? '—' : `${services.length}+`, label: 'Services' },
+              { value: loading ? '—' : `${services.length}`, label: 'Services' },
               { value: '10K+', label: 'Patients Served' },
               { value: '100%', label: 'Certified Staff' },
             ].map(({ value, label }) => (
