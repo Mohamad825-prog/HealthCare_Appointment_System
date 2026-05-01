@@ -75,6 +75,17 @@ function formatAppointment(row, doctorInfo = null) {
     };
 }
 
+async function getDoctorOwnedAppointment(appointmentId, doctorId) {
+    const { data, error } = await supabase
+        .from("appointments")
+        .select("*")
+        .eq("id", appointmentId)
+        .eq("doctor_id", doctorId)
+        .maybeSingle();
+
+    return { data, error };
+}
+
 // To getAppointments (admin)
 export const getAppointments = async (req, res) => {
     try {
@@ -611,7 +622,7 @@ export const getAppointmentsByDoctor = async (req, res) => {
 
         let query = supabase.from('appointments').select(`
             *,
-            doctor:doctor_id ( id, name, specialization, image_url, image )
+            doctor:doctor_id ( id, name, specialization, image_url )
         `, { count: 'exact' }).eq('doctor_id', doctorId);
 
         if (mobile) query = query.eq('mobile', mobile);
@@ -639,6 +650,169 @@ export const getAppointmentsByDoctor = async (req, res) => {
     }
 };
 
+export const getAppointmentsForAuthenticatedDoctor = async (req, res) => {
+    try {
+        const doctorId = req.doctor?.id;
+        if (!doctorId) {
+            return res.status(401).json({
+                success: false,
+                message: "Doctor authorization required."
+            });
+        }
+
+        const { mobile, status, search = "", limit: limitRaw = 50, page: pageRaw = 1 } = req.query;
+        const limit = Math.min(200, Math.max(1, parseInt(limitRaw, 10) || 50));
+        const page = Math.max(1, parseInt(pageRaw, 10) || 1);
+        const from = (page - 1) * limit;
+        const to = from + limit - 1;
+
+        let query = supabase.from("appointments").select(`
+            *,
+            doctor:doctor_id ( id, name, specialization, image_url )
+        `, { count: "exact" }).eq("doctor_id", doctorId);
+
+        if (mobile) query = query.eq("mobile", mobile);
+        if (status) query = query.eq("status", status);
+        if (search) {
+            query = query.or(`patient_name.ilike.%${search}%,mobile.ilike.%${search}%`);
+        }
+
+        const { data: appointments, count, error } = await query
+            .order("date", { ascending: true })
+            .order("time", { ascending: true })
+            .range(from, to);
+
+        if (error) throw error;
+
+        const formatted = appointments.map((apt) => formatAppointment(apt, apt.doctor));
+        return res.json({
+            success: true,
+            appointments: formatted,
+            data: formatted,
+            meta: { page, limit, total: count, count: formatted.length }
+        });
+    } catch (err) {
+        console.error("getAppointmentsForAuthenticatedDoctor unexpected:", err);
+        return res.status(500).json({ success: false, message: "Server error" });
+    }
+};
+
+export const updateDoctorAppointment = async (req, res) => {
+    try {
+        const doctorId = req.doctor?.id;
+        const { id } = req.params;
+        const body = req.body || {};
+
+        if (!doctorId) {
+            return res.status(401).json({
+                success: false,
+                message: "Doctor authorization required."
+            });
+        }
+
+        const { data: appt, error: fetchError } = await getDoctorOwnedAppointment(id, doctorId);
+
+        if (fetchError) throw fetchError;
+        if (!appt) {
+            return res.status(404).json({
+                success: false,
+                message: "Appointment not found for this doctor."
+            });
+        }
+
+        const terminal = appt.status === "Completed" || appt.status === "Canceled";
+        if (terminal && body.status && body.status !== appt.status) {
+            return res.status(400).json({
+                success: false,
+                message: "Cannot change status of a completed/canceled appointment"
+            });
+        }
+
+        const updates = {};
+        if (body.status) updates.status = body.status;
+
+        if (body.date && body.time) {
+            if (terminal) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Cannot reschedule completed/canceled appointment"
+                });
+            }
+            updates.date = body.date;
+            updates.time = body.time;
+            updates.status = "Rescheduled";
+            updates.rescheduled_to = { date: body.date, time: body.time };
+        }
+
+        const { data: updated, error: updateError } = await supabase
+            .from("appointments")
+            .update(updates)
+            .eq("id", id)
+            .eq("doctor_id", doctorId)
+            .select(`
+                *,
+                doctor:doctor_id ( id, name, specialization, image_url )
+            `)
+            .single();
+
+        if (updateError) throw updateError;
+
+        return res.json({ success: true, appointment: formatAppointment(updated, updated.doctor) });
+    } catch (err) {
+        console.error("updateDoctorAppointment unexpected:", err);
+        return res.status(500).json({ success: false, message: "Server error" });
+    }
+};
+
+export const cancelDoctorAppointment = async (req, res) => {
+    try {
+        const doctorId = req.doctor?.id;
+        const { id } = req.params;
+
+        if (!doctorId) {
+            return res.status(401).json({
+                success: false,
+                message: "Doctor authorization required."
+            });
+        }
+
+        const { data: appt, error: fetchError } = await getDoctorOwnedAppointment(id, doctorId);
+
+        if (fetchError) throw fetchError;
+        if (!appt) {
+            return res.status(404).json({
+                success: false,
+                message: "Appointment not found for this doctor."
+            });
+        }
+
+        if (appt.status === "Completed") {
+            return res.status(400).json({
+                success: false,
+                message: "Cannot cancel a completed appointment"
+            });
+        }
+
+        const { data: updated, error: updateError } = await supabase
+            .from("appointments")
+            .update({ status: "Canceled" })
+            .eq("id", id)
+            .eq("doctor_id", doctorId)
+            .select(`
+                *,
+                doctor:doctor_id ( id, name, specialization, image_url )
+            `)
+            .single();
+
+        if (updateError) throw updateError;
+
+        return res.json({ success: true, appointment: formatAppointment(updated, updated.doctor) });
+    } catch (err) {
+        console.error("cancelDoctorAppointment unexpected:", err);
+        return res.status(500).json({ success: false, message: "Server error" });
+    }
+};
+
 // To get Registered user count (via Clerk)
 export async function getRegisteredUserCount(req, res) {
     try {
@@ -659,5 +833,8 @@ export default {
     cancelAppointment,
     getStats,
     getAppointmentsByDoctor,
+    getAppointmentsForAuthenticatedDoctor,
+    updateDoctorAppointment,
+    cancelDoctorAppointment,
     getRegisteredUserCount
 };
