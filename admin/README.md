@@ -1,16 +1,93 @@
-# React + Vite
+# Admin App
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+This app is the admin dashboard for the Healthcare Appointment System. It is a separate React application used for operational clinic management, including doctor management, service management, and appointment monitoring.
 
-Currently, two official plugins are available:
+## What This App Contains
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+- Admin sign-in gate using Clerk
+- Dashboard summary pages
+- Doctor creation and listing pages
+- Service creation, listing, and editing pages
+- Doctor appointments management page
+- Service appointments management page
+- Service statistics and revenue summary page
 
-## React Compiler
+## Main Routes
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+- `/` - Admin landing / hero page
+- `/h` - Protected admin home/dashboard
+- `/add` - Add doctor
+- `/list` - List doctors
+- `/appointments` - Doctor appointments management
+- `/service-dashboard` - Service statistics dashboard
+- `/add-service` - Add service
+- `/list-service` - List and edit services
+- `/service-appointments` - Service appointments management
 
-## Expanding the ESLint configuration
+All management routes except `/` are wrapped in Clerk-based route protection inside `src/App.jsx`.
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+## Key Features
+
+- Clerk-protected admin dashboard access
+- Add and delete doctors
+- Add, edit, and delete services
+- View doctor appointments and cancel them when needed
+- View service appointments, update status, reschedule, and cancel
+- Revenue and activity summaries based on backend data
+- Doctor and service image upload integration through the backend
+
+## Local Development
+
+Install dependencies:
+
+```bash
+npm install
+```
+
+Run the development server:
+
+```bash
+npm run dev
+```
+
+Other scripts:
+
+```bash
+npm run build
+npm run preview
+npm run lint
+```
+
+## Environment
+
+Create a local `.env` file in the `admin` folder with:
+
+```env
+VITE_CLERK_PUBLISHABLE_KEY=your_clerk_publishable_key
+```
+
+Notes:
+
+- The admin app currently expects the backend API to be available at `http://localhost:4000`.
+- The backend CORS setup currently allows local admin/frontend origins such as `http://localhost:5173` and `http://localhost:5174`.
+- This app uses Clerk to protect admin-side routes on the frontend. Backend admin authorization is not implemented as a separate admin token system in this app.
+
+## Project Structure
+
+```text
+admin/
+|- src/
+|  |- components/   # Dashboard, list, add, and management components
+|  |- pages/        # Route-level page wrappers
+|  |- assets/       # Images and shared style objects
+|  |- App.jsx       # Route definitions and RequireAuth wrapper
+|  `- main.jsx      # App entry with ClerkProvider and BrowserRouter
+|- package.json
+`- vite.config.js
+```
+
+## Notes
+
+- This app is focused on clinic operations, not patient booking.
+- Service appointment management is more advanced than doctor appointment management in the current implementation.
+- Contact messages are saved by the backend, but a dedicated admin contact-message management page is not currently present in this app.
