@@ -1,8 +1,58 @@
 import { supabase } from '../config/supabase.js';
 import { uploadToCloudinary, deleteFromCloudinary } from "../utils/cloudinary.js";
 import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
+
+const BCRYPT_SALT_ROUNDS = 10;
+const BCRYPT_HASH_REGEX = /^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$/;
 
 // Helper function to handle doctor creation and updating
+
+function omitDoctorPassword(raw = {}) {
+    const doctor = { ...raw };
+    delete doctor.password;
+    return doctor;
+}
+
+async function hashDoctorPassword(password) {
+    return bcrypt.hash(password, BCRYPT_SALT_ROUNDS);
+}
+
+function isBcryptHash(password = "") {
+    return typeof password === "string" && BCRYPT_HASH_REGEX.test(password);
+}
+
+async function verifyAndUpgradeDoctorPassword(doctor, password) {
+    if (!doctor?.password || typeof doctor.password !== "string") {
+        return false;
+    }
+
+    if (isBcryptHash(doctor.password)) {
+        return bcrypt.compare(password, doctor.password);
+    }
+
+    if (doctor.password !== password) {
+        return false;
+    }
+
+    try {
+        const hashedPassword = await hashDoctorPassword(password);
+        const { error } = await supabase
+            .from('doctors')
+            .update({ password: hashedPassword })
+            .eq('id', doctor.id);
+
+        if (error) {
+            console.error("Doctor password migration error:", error);
+        } else {
+            doctor.password = hashedPassword;
+        }
+    } catch (error) {
+        console.error("Doctor password migration error:", error);
+    }
+
+    return true;
+}
 
 // This function will convert time to number of minutes since midnight;
 const parseTimeToMinutes = (t = "") => {
@@ -40,7 +90,7 @@ function parseScheduleInput(s) {
 
 // This function will normalize the doctor document before sending it to the client, ensuring that the schedule is a plain object, and setting default values for availability, patients, rating, and fee if they are missing
 function normalizeDocForClient(raw = {}) {
-    const doc = { ...raw };
+    const doc = omitDoctorPassword(raw);
 
     // ensure schedule is a plain object (Supabase returns JSONB as object already)
     if (!doc.schedule || typeof doc.schedule !== "object") {
@@ -95,13 +145,14 @@ export async function createDoctor(req, res) {
         }
 
         const schedule = parseScheduleInput(body.schedule);
+        const hashedPassword = await hashDoctorPassword(body.password);
 
         // Insert new doctor
         const { data: newDoctor, error: insertError } = await supabase
             .from('doctors')
             .insert({
                 email: emailLC,
-                password: body.password,
+                password: hashedPassword,
                 name: body.name,
                 specialization: body.specialization || "",
                 image_url: imageUrl,
@@ -138,7 +189,6 @@ export async function createDoctor(req, res) {
         }, secret, { expiresIn: "7d" });
 
         const out = normalizeDocForClient(newDoctor);
-        delete out.password;
 
         return res.status(201).json({
             success: true,
@@ -186,7 +236,7 @@ export const getDoctors = async (req, res) => {
         const doctorIds = doctors.map(d => d.id);
         const { data: appointments, error: aptErr } = await supabase
             .from('appointments')
-            .select('doctor_id, status, fees')
+            .select('doctor_id, status, fees, payment')
             .in('doctor_id', doctorIds);
 
         if (aptErr) {
@@ -203,9 +253,12 @@ export const getDoctors = async (req, res) => {
                 stats[apt.doctor_id].total++;
                 if (apt.status === "Confirmed" || apt.status === "Completed") {
                     stats[apt.doctor_id].completed++;
-                    stats[apt.doctor_id].earnings += (apt.fees || 0);
                 } else if (apt.status === "Canceled") {
                     stats[apt.doctor_id].canceled++;
+                }
+
+                if (apt.payment?.status === "Paid") {
+                    stats[apt.doctor_id].earnings += (apt.fees || 0);
                 }
             });
         }
@@ -230,7 +283,7 @@ export const getDoctors = async (req, res) => {
             qualifications: d.qualifications ?? "",
             location: d.location ?? "",
             success: d.success ?? "",
-            raw: d,
+            raw: omitDoctorPassword(d),
         }));
 
         return res.json({
@@ -330,7 +383,9 @@ export async function updateDoctor(req, res) {
             updates.email = body.email.toLowerCase();
         }
 
-        if (body.password) updates.password = body.password;
+        if (body.password) {
+            updates.password = await hashDoctorPassword(body.password);
+        }
 
         const { data: updatedDoctor, error: updateError } = await supabase
             .from('doctors')
@@ -345,7 +400,6 @@ export async function updateDoctor(req, res) {
         }
 
         const out = normalizeDocForClient(updatedDoctor);
-        delete out.password;
         return res.json({ success: true, data: out });
     } catch (err) {
         console.error("updateDoctor error:", err);
@@ -440,7 +494,6 @@ export async function toggleAvailability(req, res) {
         }
 
         const out = normalizeDocForClient(updated);
-        delete out.password;
         return res.json({ success: true, data: out });
     } catch (err) {
         console.error("Toggle availability error:", err);
@@ -472,7 +525,8 @@ export async function doctorLogin(req, res) {
             });
         }
 
-        if (doctor.password !== password) {
+        const isPasswordValid = await verifyAndUpgradeDoctorPassword(doctor, password);
+        if (!isPasswordValid) {
             return res.status(401).json({
                 success: false,
                 message: "Invalid email or password"
@@ -493,8 +547,7 @@ export async function doctorLogin(req, res) {
             role: "doctor"
         }, secret, { expiresIn: "7d" });
 
-        const out = { ...doctor };
-        delete out.password;
+        const out = omitDoctorPassword(doctor);
         return res.json({ success: true, token, data: out });
     } catch (err) {
         console.error("Doctor login error:", err);

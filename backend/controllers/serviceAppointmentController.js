@@ -1,9 +1,51 @@
 import Stripe from "stripe";
 import { getAuth } from "@clerk/express";
 import { supabase } from "../config/supabase.js";
+import {
+    sendServiceAppointmentCreatedEmail,
+    sendServiceCashPaymentConfirmedEmail,
+} from "../utils/email.js";
+import {
+    calculateAgeFromDateOfBirth,
+    fetchPatientProfileByClerkUserId,
+    trimString,
+} from "../utils/patientProfile.js";
 
 const stripeKey = process.env.STRIPE_SECRET_KEY || null;
 const stripe = stripeKey ? new Stripe(stripeKey, { apiVersion: "2022-11-15" }) : null;
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const MAJOR_ADMIN_ID = process.env.MAJOR_ADMIN_ID || null;
+const VALID_PAYMENT_STATUSES = ["Pending", "Paid", "Failed", "Refunded"];
+const columnSupportCache = new Map();
+const columnWarningCache = new Set();
+const FLEXIBLE_SCHEDULE_SCHEMA_MESSAGE =
+    "Database migration required: allow null values for service_appointments date, hour, minute, and ampm so services without fixed slots can be booked.";
+const ZERO_DECIMAL_CURRENCIES = new Set([
+    "bif", "clp", "djf", "gnf", "jpy", "kmf", "krw", "mga",
+    "pyg", "rwf", "ugx", "vnd", "vuv", "xaf", "xof", "xpf",
+]);
+
+function normalizeStripeCurrency(value) {
+    const currency = String(value || "usd").trim().toLowerCase();
+    return /^[a-z]{3}$/.test(currency) ? currency : "usd";
+}
+
+const STRIPE_CURRENCY = normalizeStripeCurrency(process.env.STRIPE_CURRENCY || "usd");
+
+function toStripeUnitAmount(amount, currency = STRIPE_CURRENCY) {
+    const numericAmount = Number(amount);
+    if (!Number.isFinite(numericAmount)) return 0;
+    return ZERO_DECIMAL_CURRENCIES.has(normalizeStripeCurrency(currency))
+        ? Math.round(numericAmount)
+        : Math.round(numericAmount * 100);
+}
+
+function fromStripeUnitAmount(amount, currency = STRIPE_CURRENCY) {
+    const numericAmount = Number(amount || 0);
+    return ZERO_DECIMAL_CURRENCIES.has(normalizeStripeCurrency(currency))
+        ? numericAmount
+        : Math.round(numericAmount) / 100;
+}
 
 // Helper functions
 const safeNumber = (val) => {
@@ -11,6 +53,111 @@ const safeNumber = (val) => {
     const n = Number(val);
     return Number.isFinite(n) ? n : null;
 };
+
+const normalizeAppointmentStatus = (status) => String(status || "").trim();
+const normalizePaymentMethod = (method) =>
+    String(method || "").trim().toLowerCase() === "cash" ? "Cash" : "Online";
+const normalizePaymentStatus = (status) => {
+    const incoming = String(status || "").trim();
+    return VALID_PAYMENT_STATUSES.find((item) => item.toLowerCase() === incoming.toLowerCase()) || "Pending";
+};
+const normalizeOptionalEmail = (value) => {
+    const email = String(value || "").trim().toLowerCase();
+    return EMAIL_REGEX.test(email) ? email : "";
+};
+
+const getAdminNotifyEmail = () => normalizeOptionalEmail(process.env.ADMIN_NOTIFY_EMAIL);
+const isCanceledStatus = (status) => normalizeAppointmentStatus(status) === "Canceled";
+const isCompletedStatus = (status) => normalizeAppointmentStatus(status) === "Completed";
+const isTerminalAppointmentStatus = (status) => isCanceledStatus(status) || isCompletedStatus(status);
+
+const hasPaymentMutation = (body = {}) =>
+    body.payment !== undefined ||
+    body.paymentStatus !== undefined ||
+    body["payment.status"] !== undefined ||
+    body.paidAt !== undefined ||
+    body.paid_at !== undefined;
+
+function buildPayment({
+    method,
+    status = "Pending",
+    amount = 0,
+    paidAt = null,
+    confirmedBy = null,
+    note = "",
+    providerId = null,
+    sessionId = null,
+    extra = {},
+}) {
+    return {
+        ...extra,
+        method: normalizePaymentMethod(method),
+        status: normalizePaymentStatus(status),
+        amount: safeNumber(amount) ?? 0,
+        paidAt,
+        confirmedBy,
+        ...(note ? { note } : {}),
+        ...(providerId ? { providerId } : {}),
+        ...(sessionId ? { sessionId } : {}),
+    };
+}
+
+function getPaymentStatus(payment) {
+    return normalizePaymentStatus(payment?.status || "Pending");
+}
+
+function getPaymentMethod(payment) {
+    return normalizePaymentMethod(payment?.method || "Online");
+}
+
+function sanitizePaymentForResponse(payment) {
+    if (!payment || typeof payment !== "object") return payment || null;
+    const { sessionId, ...safePayment } = payment;
+    return safePayment;
+}
+
+function resolveAdminIdentity(req) {
+    const clerkUserId = resolveClerkUserId(req);
+    if (clerkUserId) {
+        return { id: clerkUserId, verifiedByClerk: true };
+    }
+
+    const headerAdminId = String(req.get("x-admin-id") || "").trim();
+    if (headerAdminId) {
+        return { id: headerAdminId, verifiedByClerk: false };
+    }
+
+    return { id: null, verifiedByClerk: false };
+}
+
+function validateAdminRequest(req, res) {
+    if (!MAJOR_ADMIN_ID) {
+        res.status(500).json({
+            success: false,
+            message: "Admin identity is not configured on the server.",
+        });
+        return null;
+    }
+
+    const adminIdentity = resolveAdminIdentity(req);
+    if (!adminIdentity.id) {
+        res.status(401).json({
+            success: false,
+            message: "Admin authorization required.",
+        });
+        return null;
+    }
+
+    if (String(adminIdentity.id) !== String(MAJOR_ADMIN_ID)) {
+        res.status(403).json({
+            success: false,
+            message: "Only the configured admin can update service cash payment status.",
+        });
+        return null;
+    }
+
+    return adminIdentity;
+}
 
 function parseTimeString(timeStr) {
     if (!timeStr || typeof timeStr !== "string") return null;
@@ -64,6 +211,7 @@ function formatServiceAppointment(row, serviceInfo = null) {
         id: row.id,
         createdBy: row.created_by,
         patientName: row.patient_name,
+        patientEmail: row.patient_email || "",
         mobile: row.mobile,
         age: row.age,
         gender: row.gender,
@@ -77,11 +225,144 @@ function formatServiceAppointment(row, serviceInfo = null) {
         ampm: row.ampm,
         status: row.status,
         rescheduledTo: row.rescheduled_to,
-        payment: row.payment,
+        payment: sanitizePaymentForResponse(row.payment),
+        paidAt: row.paid_at || row.payment?.paidAt || null,
+        flexibleScheduling: Boolean(row.payment?.meta?.flexibleScheduling),
         createdAt: row.created_at,
         updatedAt: row.updated_at,
         notes: row.notes || "",
     };
+}
+
+function isMissingColumnError(error, columnName) {
+    const text = [error?.code, error?.message, error?.details, error?.hint]
+        .filter(Boolean)
+        .join(" ");
+
+    return /column .* does not exist|could not find the .* column/i.test(text) &&
+        text.toLowerCase().includes(String(columnName || "").toLowerCase());
+}
+
+function isScheduleNotNullConstraintError(error) {
+    const text = [error?.code, error?.message, error?.details]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+
+    return error?.code === "23502" &&
+        text.includes("service_appointments") &&
+        (
+            text.includes("column \"date\"") ||
+            text.includes("column \"hour\"") ||
+            text.includes("column \"minute\"") ||
+            text.includes("column \"ampm\"")
+        );
+}
+
+async function tableSupportsColumn(tableName, columnName) {
+    const cacheKey = `${tableName}.${columnName}`;
+    if (columnSupportCache.has(cacheKey)) {
+        return columnSupportCache.get(cacheKey);
+    }
+
+    const { error } = await supabase
+        .from(tableName)
+        .select(columnName)
+        .limit(1);
+
+    if (!error) {
+        columnSupportCache.set(cacheKey, true);
+        return true;
+    }
+
+    if (isMissingColumnError(error, columnName)) {
+        if (!columnWarningCache.has(cacheKey)) {
+            columnWarningCache.add(cacheKey);
+            console.warn(`[service-appointments] ${cacheKey} is not available yet. Run the recommended SQL if this field is required.`);
+        }
+    } else {
+        console.warn(`[service-appointments] Unable to verify ${cacheKey}:`, error?.message || error);
+    }
+
+    return false;
+}
+
+async function withPatientEmailIfSupported(payload, emailValue) {
+    const patientEmail = normalizeOptionalEmail(emailValue);
+    if (!patientEmail) return payload;
+
+    const supportsPatientEmail = await tableSupportsColumn("service_appointments", "patient_email");
+    if (!supportsPatientEmail) return payload;
+
+    return {
+        ...payload,
+        patient_email: patientEmail,
+    };
+}
+
+function formatServiceTimeLabel({ time, hour, minute, ampm }) {
+    if (time && String(time).trim()) {
+        return String(time).trim();
+    }
+
+    if (hour === undefined || hour === null || minute === undefined || minute === null || !ampm) {
+        return "N/A";
+    }
+
+    return `${hour}:${String(minute).padStart(2, "0")} ${ampm}`;
+}
+
+function serviceHasScheduledSlots(slots) {
+    if (!slots || typeof slots !== "object") return false;
+
+    if (Array.isArray(slots)) {
+        return slots.length > 0;
+    }
+
+    return Object.values(slots).some((slotList) =>
+        Array.isArray(slotList) && slotList.length > 0
+    );
+}
+
+async function notifyServiceAppointmentCreatedEmails(appointment, fallbackEmail = "", explicitTimeLabel = "") {
+    const patientEmail = normalizeOptionalEmail(appointment?.patient_email || fallbackEmail);
+    const adminEmail = getAdminNotifyEmail();
+    const paymentMethod = appointment?.payment?.method || "Online";
+    const paymentStatus = String(appointment?.payment?.status || "").trim().toLowerCase();
+    const commonPayload = {
+        patientName: appointment?.patient_name || "",
+        serviceName: appointment?.service_name || "",
+        date: appointment?.date || "",
+        timeLabel: explicitTimeLabel || formatServiceTimeLabel({
+            hour: appointment?.hour,
+            minute: appointment?.minute,
+            ampm: appointment?.ampm,
+        }),
+        fees: appointment?.fees ?? 0,
+        paymentMethod,
+        status: appointment?.status || "",
+        mobile: appointment?.mobile || "",
+        isOnlinePending:
+            paymentMethod === "Online" &&
+            paymentStatus !== "paid" &&
+            paymentStatus !== "confirmed" &&
+            Number(appointment?.fees || 0) > 0,
+    };
+
+    if (patientEmail) {
+        await sendServiceAppointmentCreatedEmail({
+            to: patientEmail,
+            ...commonPayload,
+        });
+    }
+
+    if (adminEmail) {
+        await sendServiceAppointmentCreatedEmail({
+            to: adminEmail,
+            ...commonPayload,
+            isAdminNotification: true,
+        });
+    }
 }
 
 // To create a service appointment
@@ -110,25 +391,74 @@ export const createServiceAppointment = async (req, res) => {
             amount: amountFromBody,
             fees: feesFromBody,
             email,
+            flexibleScheduling = false,
             meta = {},
             notes = "",
             serviceImageUrl: serviceImageUrlFromBody,
             serviceImagePublicId: serviceImagePublicIdFromBody,
         } = body;
+        const normalizedPatientEmail = normalizeOptionalEmail(email);
+        const shouldLoadPatientProfile =
+            !trimString(patientName) ||
+            !trimString(mobile) ||
+            age === undefined ||
+            age === null ||
+            age === "" ||
+            !trimString(gender) ||
+            !normalizedPatientEmail;
+
+        const patientProfile = shouldLoadPatientProfile
+            ? await fetchPatientProfileByClerkUserId(clerkUserId)
+            : null;
+
+        const resolvedPatientName = trimString(patientName) || patientProfile?.fullName || "";
+        const resolvedMobile = trimString(mobile) || patientProfile?.mobile || "";
+        const fallbackAge = patientProfile?.age ?? calculateAgeFromDateOfBirth(patientProfile?.dateOfBirth);
+        const rawResolvedAge =
+            age !== undefined && age !== null && age !== ""
+                ? age
+                : fallbackAge;
+        const resolvedAge =
+            rawResolvedAge === undefined || rawResolvedAge === null || rawResolvedAge === ""
+                ? null
+                : Number(rawResolvedAge);
+        const resolvedGender = trimString(gender) || patientProfile?.gender || "";
+        const resolvedPatientEmail = normalizeOptionalEmail(email || patientProfile?.email || "");
 
         if (!serviceId) return res.status(400).json({ success: false, message: "serviceId is required" });
-        if (!patientName || !String(patientName).trim()) return res.status(400).json({ success: false, message: "patientName is required" });
-        if (!mobile || !String(mobile).trim()) return res.status(400).json({ success: false, message: "mobile is required" });
-        if (!date || !String(date).trim()) return res.status(400).json({ success: false, message: "date is required (YYYY-MM-DD)" });
+        if (!resolvedPatientName) return res.status(400).json({ success: false, message: "patientName is required" });
+        if (!resolvedMobile) return res.status(400).json({ success: false, message: "mobile is required" });
+
+        let svc = null;
+        try {
+            const { data: serviceData, error: svcError } = await supabase
+                .from('services')
+                .select('id, name, image_url, image_public_id, slots')
+                .eq('id', serviceId)
+                .maybeSingle();
+            if (!svcError && serviceData) svc = serviceData;
+        } catch (e) { console.warn("Service lookup failed:", e?.message || e); }
+
+        const hasScheduledSlots = serviceHasScheduledSlots(svc?.slots);
+        const isFlexibleScheduling = Boolean(flexibleScheduling) || !hasScheduledSlots;
+        const finalDate = date && String(date).trim() ? String(date).trim() : null;
+
+        if (!isFlexibleScheduling && !finalDate) {
+            return res.status(400).json({ success: false, message: "date is required (YYYY-MM-DD)" });
+        }
 
         const numericAmount = safeNumber(amountFromBody ?? feesFromBody ?? 0);
         if (numericAmount === null || numericAmount < 0) return res.status(400).json({ success: false, message: "amount/fees must be a valid number" });
+
+        if (resolvedAge !== null && (!Number.isFinite(resolvedAge) || resolvedAge < 0 || resolvedAge > 120)) {
+            return res.status(400).json({ success: false, message: "age must be a reasonable number" });
+        }
 
         let finalHour = hour !== undefined ? safeNumber(hour) : null;
         let finalMinute = minute !== undefined ? safeNumber(minute) : null;
         let finalAmpm = ampm || null;
 
-        if (time && (finalHour === null || finalHour === undefined)) {
+        if (!isFlexibleScheduling && time && (finalHour === null || finalHour === undefined)) {
             const parsed = parseTimeString(time);
             if (!parsed) return res.status(400).json({ success: false, message: "time string couldn't be parsed" });
             finalHour = parsed.hour;
@@ -136,38 +466,35 @@ export const createServiceAppointment = async (req, res) => {
             finalAmpm = parsed.ampm;
         }
 
-        if (finalHour === null || finalMinute === null || (finalAmpm !== "AM" && finalAmpm !== "PM")) {
-            return res.status(400).json({ success: false, message: "Time missing or invalid — provide time string or hour, minute and ampm." });
+        if (!isFlexibleScheduling && (finalHour === null || finalMinute === null || (finalAmpm !== "AM" && finalAmpm !== "PM"))) {
+            return res.status(400).json({ success: false, message: "Time missing or invalid - provide time string or hour, minute and ampm." });
+        }
+
+        if (isFlexibleScheduling) {
+            finalHour = null;
+            finalMinute = null;
+            finalAmpm = null;
         }
 
         // Duplicate booking check
-        try {
-            const { data: existing, error: dupError } = await supabase
-                .from('service_appointments')
-                .select('id')
-                .eq('service_id', String(serviceId))
-                .eq('created_by', clerkUserId)
-                .eq('date', String(date))
-                .eq('hour', Number(finalHour))
-                .eq('minute', Number(finalMinute))
-                .eq('ampm', finalAmpm)
-                .neq('status', 'Canceled')
-                .maybeSingle();
-            if (existing) return res.status(409).json({ success: false, message: "You already have a booking for this service at the selected date and time." });
-        } catch (chkErr) {
-            console.warn("Duplicate booking check failed:", chkErr);
+        if (!isFlexibleScheduling) {
+            try {
+                const { data: existing, error: dupError } = await supabase
+                    .from('service_appointments')
+                    .select('id')
+                    .eq('service_id', String(serviceId))
+                    .eq('created_by', clerkUserId)
+                    .eq('date', finalDate)
+                    .eq('hour', Number(finalHour))
+                    .eq('minute', Number(finalMinute))
+                    .eq('ampm', finalAmpm)
+                    .neq('status', 'Canceled')
+                    .maybeSingle();
+                if (existing) return res.status(409).json({ success: false, message: "You already have a booking for this service at the selected date and time." });
+            } catch (chkErr) {
+                console.warn("Duplicate booking check failed:", chkErr);
+            }
         }
-
-        // Fetch service snapshot
-        let svc = null;
-        try {
-            const { data: serviceData, error: svcError } = await supabase
-                .from('services')
-                .select('id, name, image_url, image_public_id')
-                .eq('id', serviceId)
-                .maybeSingle();
-            if (!svcError && serviceData) svc = serviceData;
-        } catch (e) { console.warn("Service lookup failed:", e?.message || e); }
 
         let resolvedServiceName = serviceNameFromBody || (svc && (svc.name || svc.title)) || "Service";
         const svcImageUrlFromDB = svc && (String(svc.image_url || "").trim() || "");
@@ -175,50 +502,94 @@ export const createServiceAppointment = async (req, res) => {
         const finalServiceImageUrl = (svcImageUrlFromDB && svcImageUrlFromDB.length) ? svcImageUrlFromDB : ((serviceImageUrlFromBody && String(serviceImageUrlFromBody).trim()) || "");
         const finalServiceImagePublicId = (svcImagePublicIdFromDB && svcImagePublicIdFromDB.length) ? svcImagePublicIdFromDB : ((serviceImagePublicIdFromBody && String(serviceImagePublicIdFromBody).trim()) || "");
 
-        const base = {
+        const base = await withPatientEmailIfSupported({
             service_id: serviceId,
             service_name: resolvedServiceName,
             service_image: { url: finalServiceImageUrl, publicId: finalServiceImagePublicId },
-            patient_name: String(patientName).trim(),
-            mobile: String(mobile).trim(),
-            age: age ? Number(age) : undefined,
-            gender: gender || "",
-            date: String(date),
-            hour: Number(finalHour),
-            minute: Number(finalMinute),
+            patient_name: resolvedPatientName,
+            mobile: resolvedMobile,
+            age: resolvedAge,
+            gender: resolvedGender,
+            date: finalDate,
+            hour: finalHour === null ? null : Number(finalHour),
+            minute: finalMinute === null ? null : Number(finalMinute),
             ampm: finalAmpm,
             fees: numericAmount,
             created_by: clerkUserId,
             notes: notes || "",
-        };
+        }, resolvedPatientEmail);
+        const timeLabel = formatServiceTimeLabel({
+            time: isFlexibleScheduling ? "To be scheduled" : time,
+            hour: finalHour,
+            minute: finalMinute,
+            ampm: finalAmpm,
+        });
+        const paymentMeta = { ...meta, flexibleScheduling: isFlexibleScheduling };
+        const normalizedPaymentMethod = normalizePaymentMethod(paymentMethod);
 
         // Free appointment
         if (numericAmount === 0) {
+            const paidAt = new Date().toISOString();
+            const insertPayload = {
+                ...base,
+                status: "Pending",
+                payment: buildPayment({
+                    method: normalizedPaymentMethod,
+                    status: "Paid",
+                    amount: 0,
+                    paidAt,
+                    extra: {
+                        meta: {
+                            ...paymentMeta,
+                            freeService: true,
+                        },
+                    },
+                }),
+            };
+            if (await tableSupportsColumn("service_appointments", "paid_at")) {
+                insertPayload.paid_at = paidAt;
+            }
+
             const { data: created, error: insertError } = await supabase
                 .from('service_appointments')
-                .insert({
-                    ...base,
-                    status: "Pending",
-                    payment: { method: "Cash", status: "Pending", amount: 0, paidAt: new Date().toISOString() }
-                })
+                .insert(insertPayload)
                 .select()
                 .single();
-            if (insertError) throw insertError;
+            if (insertError) {
+                if (isFlexibleScheduling && isScheduleNotNullConstraintError(insertError)) {
+                    return res.status(500).json({ success: false, message: FLEXIBLE_SCHEDULE_SCHEMA_MESSAGE });
+                }
+                throw insertError;
+            }
+            await notifyServiceAppointmentCreatedEmails(created, resolvedPatientEmail, timeLabel);
             return res.status(201).json({ success: true, appointment: formatServiceAppointment(created) });
         }
 
         // Cash booking
-        if (paymentMethod === "Cash") {
+        if (normalizedPaymentMethod === "Cash") {
             const { data: created, error: insertError } = await supabase
                 .from('service_appointments')
                 .insert({
                     ...base,
                     status: "Pending",
-                    payment: { method: "Cash", status: "Pending", amount: numericAmount, meta }
+                    payment: buildPayment({
+                        method: "Cash",
+                        status: "Pending",
+                        amount: numericAmount,
+                        paidAt: null,
+                        confirmedBy: null,
+                        extra: { meta: paymentMeta },
+                    }),
                 })
                 .select()
                 .single();
-            if (insertError) throw insertError;
+            if (insertError) {
+                if (isFlexibleScheduling && isScheduleNotNullConstraintError(insertError)) {
+                    return res.status(500).json({ success: false, message: FLEXIBLE_SCHEDULE_SCHEMA_MESSAGE });
+                }
+                throw insertError;
+            }
+            await notifyServiceAppointmentCreatedEmails(created, resolvedPatientEmail, timeLabel);
             return res.status(201).json({ success: true, appointment: formatServiceAppointment(created), checkoutUrl: null });
         }
 
@@ -230,21 +601,25 @@ export const createServiceAppointment = async (req, res) => {
         const successUrl = `${frontendBase}/service-appointment/success?session_id={CHECKOUT_SESSION_ID}`;
         const cancelUrl = `${frontendBase}/service-appointment/cancel`;
 
+        const stripeUnitAmount = toStripeUnitAmount(numericAmount);
+
         let session;
         try {
             session = await stripe.checkout.sessions.create({
                 payment_method_types: ["card"],
                 mode: "payment",
-                customer_email: email ? String(email) : undefined,
+                customer_email: resolvedPatientEmail || undefined,
                 line_items: [
                     {
                         price_data: {
-                            currency: "inr",
+                            currency: STRIPE_CURRENCY,
                             product_data: {
                                 name: `Service: ${String(resolvedServiceName).slice(0, 60)}`,
-                                description: `Appointment on ${base.date} ${base.hour}:${String(base.minute).padStart(2, "0")} ${base.ampm}`,
+                                description: isFlexibleScheduling
+                                    ? "Flexible scheduling - clinic will contact the patient"
+                                    : `Appointment on ${base.date} ${base.hour}:${String(base.minute).padStart(2, "0")} ${base.ampm}`,
                             },
-                            unit_amount: Math.round(numericAmount * 100),
+                            unit_amount: stripeUnitAmount,
                         },
                         quantity: 1,
                     },
@@ -258,6 +633,8 @@ export const createServiceAppointment = async (req, res) => {
                     mobile: base.mobile,
                     clerkUserId: base.created_by || "",
                     serviceImageUrl: finalServiceImageUrl ? String(finalServiceImageUrl).slice(0, 200) : "",
+                    flexibleScheduling: isFlexibleScheduling ? "true" : "false",
+                    currency: STRIPE_CURRENCY,
                 },
             });
         } catch (stripeErr) {
@@ -271,15 +648,28 @@ export const createServiceAppointment = async (req, res) => {
                 .from('service_appointments')
                 .insert({
                     ...base,
-                    status: "Confirmed",
-                    payment: { method: "Online", status: "Pending", amount: numericAmount, sessionId: session.id || "" },
+                    status: "Pending",
+                    payment: buildPayment({
+                        method: "Online",
+                        status: "Pending",
+                        amount: numericAmount,
+                        sessionId: session.id || "",
+                        extra: {
+                            currency: STRIPE_CURRENCY,
+                            meta: paymentMeta,
+                        },
+                    }),
                 })
                 .select()
                 .single();
             if (insertError) throw insertError;
+            await notifyServiceAppointmentCreatedEmails(created, resolvedPatientEmail, timeLabel);
             return res.status(201).json({ success: true, appointment: formatServiceAppointment(created), checkoutUrl: session.url || null });
         } catch (dbErr) {
             console.error("DB error saving service appointment after stripe session:", dbErr);
+            if (isFlexibleScheduling && isScheduleNotNullConstraintError(dbErr)) {
+                return res.status(500).json({ success: false, message: FLEXIBLE_SCHEDULE_SCHEMA_MESSAGE });
+            }
             return res.status(500).json({ success: false, message: "Failed to create appointment record" });
         }
     } catch (err) {
@@ -320,45 +710,67 @@ export const confirmServicePayment = async (req, res) => {
             message: "Payment not completed",
         });
 
-        let { data: appt, error: updateError } = await supabase
+        let { data: appt, error: findError } = await supabase
             .from('service_appointments')
-            .update({
-                payment: {
-                    method: "Online",
-                    status: "Confirmed",
-                    amount: Math.round((session.amount_total || 0) / 100),
-                    providerId: session.payment_intent || "",
-                    sessionId: session_id,
-                    paidAt: new Date().toISOString(),
-                },
-                status: "Confirmed",
-            })
+            .select('*')
             .eq('payment->>sessionId', session_id)
-            .select()
             .maybeSingle();
+        if (findError) throw findError;
 
         if (!appt && session.metadata?.appointmentId) {
             const { data: byId, error: idError } = await supabase
                 .from('service_appointments')
-                .update({
-                    payment: {
-                        method: "Online",
-                        status: "Confirmed",
-                        amount: Math.round((session.amount_total || 0) / 100),
-                        providerId: session.payment_intent || "",
-                        sessionId: session_id,
-                        paidAt: new Date().toISOString(),
-                    },
-                    status: "Confirmed",
-                })
+                .select('*')
                 .eq('id', session.metadata.appointmentId)
-                .select()
                 .maybeSingle();
+            if (idError) throw idError;
             appt = byId;
         }
 
         if (!appt) return res.status(404).json({ success: false, message: "Service appointment not found" });
-        return res.json({ success: true, appointment: formatServiceAppointment(appt) });
+        if (isCanceledStatus(appt.status)) {
+            return res.status(400).json({ success: false, message: "Cannot confirm payment for a canceled service appointment" });
+        }
+
+        const paidAt = new Date().toISOString();
+        const currency = normalizeStripeCurrency(session.currency || session.metadata?.currency || STRIPE_CURRENCY);
+        const currentPayment = appt.payment || {};
+        const updatedPayment = buildPayment({
+            method: "Online",
+            status: "Paid",
+            amount: fromStripeUnitAmount(session.amount_total || 0, currency),
+            providerId: session.payment_intent || currentPayment.providerId || "",
+            sessionId: session_id,
+            paidAt,
+            extra: {
+                ...currentPayment,
+                currency,
+                meta: {
+                    ...(currentPayment.meta || {}),
+                    flexibleScheduling:
+                        currentPayment.meta?.flexibleScheduling ??
+                        (session.metadata?.flexibleScheduling === "true"),
+                },
+            },
+        });
+        const updatePayload = { payment: updatedPayment };
+        if (!isTerminalAppointmentStatus(appt.status)) {
+            updatePayload.status = "Confirmed";
+        }
+        if (await tableSupportsColumn("service_appointments", "paid_at")) {
+            updatePayload.paid_at = paidAt;
+        }
+
+        const { data: updated, error: updateError } = await supabase
+            .from('service_appointments')
+            .update(updatePayload)
+            .eq('id', appt.id)
+            .select()
+            .single();
+
+        if (updateError) throw updateError;
+        const formatted = formatServiceAppointment(updated);
+        return res.json({ success: true, appointment: formatted, data: formatted });
     } catch (err) {
         console.error("confirmServicePayment unexpected:", err);
         return res.status(500).json({ success: false, message: "Server error" });
@@ -447,33 +859,41 @@ export const getServiceAppointmentById = async (req, res) => {
     }
 };
 
-// Helper to get current payment field (used in update)
-async function getPaymentField(id) {
-    const { data, error } = await supabase
-        .from('service_appointments')
-        .select('payment')
-        .eq('id', id)
-        .single();
-    if (error || !data) return {};
-    return data.payment || {};
-}
-
 // To update an appointment
 export const updateServiceAppointment = async (req, res) => {
     try {
         const { id } = req.params;
         const body = req.body || {};
-        const updates = {};
 
-        if (body.status !== undefined) updates.status = body.status;
-        if (body.notes !== undefined) updates.notes = body.notes;
-        if (body.payment !== undefined) updates.payment = body.payment;
-        if (body["payment.status"] !== undefined) {
-            const currentPayment = await getPaymentField(id);
-            updates.payment = { ...currentPayment, status: body["payment.status"] };
+        if (hasPaymentMutation(body)) {
+            return res.status(400).json({
+                success: false,
+                message: "Use the admin service cash payment endpoint to update payment status.",
+            });
         }
 
+        const { data: appt, error: fetchError } = await supabase
+            .from('service_appointments')
+            .select('*')
+            .eq('id', id)
+            .maybeSingle();
+
+        if (fetchError) throw fetchError;
+        if (!appt) return res.status(404).json({ success: false, message: "Service appointment not found" });
+
+        const terminal = isTerminalAppointmentStatus(appt.status);
+        if (terminal && body.status && normalizeAppointmentStatus(body.status) !== normalizeAppointmentStatus(appt.status)) {
+            return res.status(400).json({ success: false, message: "Cannot change status of a completed/canceled service appointment" });
+        }
+
+        const updates = {};
+        if (body.status !== undefined) updates.status = body.status;
+        if (body.notes !== undefined) updates.notes = body.notes;
+
         if (body.rescheduledTo) {
+            if (terminal) {
+                return res.status(400).json({ success: false, message: "Cannot reschedule a completed/canceled service appointment" });
+            }
             const { date, time } = body.rescheduledTo || {};
             updates.rescheduled_to = {};
             if (date) {
@@ -490,15 +910,6 @@ export const updateServiceAppointment = async (req, res) => {
                 updates.ampm = parsed.ampm;
             }
             if (!body.status) updates.status = "Rescheduled";
-        }
-
-        if (updates.payment) {
-            const method = updates.payment.method || updates.payment?.method;
-            if (method && String(method).toLowerCase() === "online") updates.status = updates.status || "Confirmed";
-            if (updates.payment.status && updates.payment.status === "Confirmed") {
-                updates.status = "Confirmed";
-                if (updates.payment.paidAt === undefined) updates.payment.paidAt = new Date().toISOString();
-            }
         }
 
         const { data: updated, error: updateError } = await supabase
@@ -537,10 +948,20 @@ export const cancelServiceAppointment = async (req, res) => {
             }
             throw fetchError;
         }
-        if (appt.status === "Completed") return res.status(400).json({ success: false, message: "Cannot cancel a completed appointment" });
+        if (isCompletedStatus(appt.status)) return res.status(400).json({ success: false, message: "Cannot cancel a completed appointment" });
+        if (isCanceledStatus(appt.status)) {
+            return res.json({ success: true, data: formatServiceAppointment(appt), message: "Service appointment is already canceled." });
+        }
 
-        const newPayment = { ...appt.payment };
-        newPayment.status = newPayment.status === "Paid" ? "Refunded" : "Canceled";
+        const currentPayment = appt.payment || {};
+        const newPayment = {
+            ...currentPayment,
+            status: getPaymentStatus(currentPayment) === "Paid"
+                ? "Refunded"
+                : getPaymentMethod(currentPayment) === "Online"
+                    ? "Failed"
+                    : "Pending",
+        };
 
         const { data: updated, error: updateError } = await supabase
             .from('service_appointments')
@@ -553,6 +974,119 @@ export const cancelServiceAppointment = async (req, res) => {
         return res.json({ success: true, data: formatServiceAppointment(updated) });
     } catch (err) {
         console.error("cancelServiceAppointment unexpected:", err);
+        return res.status(500).json({ success: false, message: "Server error" });
+    }
+};
+
+export const updateServiceCashPaymentStatus = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { paymentStatus, note = "" } = req.body || {};
+        const requestedStatus = normalizePaymentStatus(paymentStatus);
+        const adminIdentity = validateAdminRequest(req, res);
+
+        if (!adminIdentity) return;
+
+        if (requestedStatus !== "Paid") {
+            return res.status(400).json({
+                success: false,
+                message: "Only marking cash service payments as Paid is supported by this endpoint.",
+            });
+        }
+
+        const { data: appt, error: fetchError } = await supabase
+            .from("service_appointments")
+            .select("*")
+            .eq("id", id)
+            .maybeSingle();
+
+        if (fetchError) throw fetchError;
+        if (!appt) {
+            return res.status(404).json({
+                success: false,
+                message: "Service appointment not found with the provided id.",
+            });
+        }
+
+        const currentPayment = appt.payment || {};
+        if (getPaymentMethod(currentPayment) !== "Cash") {
+            return res.status(400).json({
+                success: false,
+                message: "Only cash service appointment payments can be manually marked as paid.",
+            });
+        }
+
+        if (getPaymentStatus(currentPayment) === "Paid") {
+            return res.json({
+                success: true,
+                message: "Cash service payment is already marked as paid.",
+                appointment: formatServiceAppointment(appt),
+                data: formatServiceAppointment(appt),
+            });
+        }
+
+        if (isCanceledStatus(appt.status)) {
+            return res.status(400).json({
+                success: false,
+                message: "Cannot mark payment as paid for a canceled service appointment.",
+            });
+        }
+
+        const paidAt = new Date().toISOString();
+        const updatedPayment = buildPayment({
+            method: "Cash",
+            status: "Paid",
+            amount: currentPayment.amount ?? appt.fees ?? 0,
+            paidAt,
+            confirmedBy: adminIdentity.id,
+            note: String(note || "").trim(),
+            extra: currentPayment,
+        });
+        const updatePayload = { payment: updatedPayment };
+        if (await tableSupportsColumn("service_appointments", "paid_at")) {
+            updatePayload.paid_at = paidAt;
+        }
+
+        const { data: updated, error: updateError } = await supabase
+            .from("service_appointments")
+            .update(updatePayload)
+            .eq("id", id)
+            .select()
+            .single();
+
+        if (updateError) throw updateError;
+
+        try {
+            const patientEmail = normalizeOptionalEmail(updated.patient_email || "");
+            if (patientEmail) {
+                await sendServiceCashPaymentConfirmedEmail({
+                    to: patientEmail,
+                    patientName: updated.patient_name || "",
+                    serviceName: updated.service_name || "",
+                    date: updated.date || "",
+                    timeLabel: formatServiceTimeLabel({
+                        hour: updated.hour,
+                        minute: updated.minute,
+                        ampm: updated.ampm,
+                    }),
+                    amount: updatedPayment.amount,
+                    paidAt,
+                    note: updatedPayment.note || "",
+                });
+            }
+        } catch (emailError) {
+            console.warn("Service cash payment confirmation email failed:", emailError?.message || emailError);
+        }
+
+        const formatted = formatServiceAppointment(updated);
+        return res.json({
+            success: true,
+            message: "Cash service payment marked as paid.",
+            appointment: formatted,
+            data: formatted,
+        });
+    } catch (err) {
+        console.error("updateServiceCashPaymentStatus unexpected:", err);
         return res.status(500).json({ success: false, message: "Server error" });
     }
 };
@@ -572,7 +1106,7 @@ export const getServiceAppointmentStats = async (req, res) => {
         const serviceIds = services.map(s => s.id);
         const { data: appointments, error: aptError } = await supabase
             .from('service_appointments')
-            .select('service_id, status')
+            .select('service_id, status, fees, payment')
             .in('service_id', serviceIds);
 
         if (aptError) throw aptError;
@@ -580,15 +1114,18 @@ export const getServiceAppointmentStats = async (req, res) => {
         const statsMap = {};
         appointments.forEach(apt => {
             if (!statsMap[apt.service_id]) {
-                statsMap[apt.service_id] = { total: 0, completed: 0, canceled: 0 };
+                statsMap[apt.service_id] = { total: 0, completed: 0, canceled: 0, paidRevenue: 0 };
             }
             statsMap[apt.service_id].total++;
             if (apt.status === "Completed") statsMap[apt.service_id].completed++;
             else if (apt.status === "Canceled") statsMap[apt.service_id].canceled++;
+            if (getPaymentStatus(apt.payment || {}) === "Paid") {
+                statsMap[apt.service_id].paidRevenue += Number(apt.payment?.amount ?? apt.fees ?? 0) || 0;
+            }
         });
 
         const result = services.map(s => {
-            const stats = statsMap[s.id] || { total: 0, completed: 0, canceled: 0 };
+            const stats = statsMap[s.id] || { total: 0, completed: 0, canceled: 0, paidRevenue: 0 };
             return {
                 id: s.id,
                 name: s.name,
@@ -597,7 +1134,7 @@ export const getServiceAppointmentStats = async (req, res) => {
                 totalAppointments: stats.total,
                 completed: stats.completed,
                 canceled: stats.canceled,
-                earning: stats.completed * (s.price || 0),
+                earning: stats.paidRevenue,
                 createdAt: s.created_at,
             };
         });
@@ -650,6 +1187,7 @@ export default {
     getServiceAppointments,
     getServiceAppointmentById,
     updateServiceAppointment,
+    updateServiceCashPaymentStatus,
     cancelServiceAppointment,
     getServiceAppointmentStats,
     getServiceAppointmentsByPatient

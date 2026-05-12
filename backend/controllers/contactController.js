@@ -1,4 +1,5 @@
 import { supabase } from "../config/supabase.js";
+import { sendContactNotificationEmail } from "../utils/email.js";
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -10,6 +11,11 @@ const trimString = (value) => {
 const normalizeOptionalString = (value) => {
     const trimmed = trimString(value);
     return trimmed || null;
+};
+
+const normalizeOptionalEmail = (value) => {
+    const trimmed = trimString(value).toLowerCase();
+    return EMAIL_REGEX.test(trimmed) ? trimmed : "";
 };
 
 export const createContactMessage = async (req, res) => {
@@ -85,6 +91,19 @@ export const createContactMessage = async (req, res) => {
             return res.status(500).json({
                 success: false,
                 message: "Failed to save your message. Please try again later.",
+            });
+        }
+
+        const adminEmail = normalizeOptionalEmail(process.env.ADMIN_NOTIFY_EMAIL);
+        if (adminEmail) {
+            await sendContactNotificationEmail({
+                to: adminEmail,
+                name: data?.name || name,
+                email: data?.email || email,
+                phone: data?.phone || phone || "",
+                subjectLine: data?.subject || subject || "",
+                message: data?.message || message,
+                createdAt: data?.created_at || new Date().toISOString(),
             });
         }
 

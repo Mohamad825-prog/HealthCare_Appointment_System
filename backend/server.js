@@ -1,14 +1,17 @@
 import express from 'express'; 
 import cors from 'cors';
-import 'dotenv/config';
 
 import { clerkMiddleware } from '@clerk/express';
-import { supabase } from './config/supabase.js';  // <-- import supabase client
+import { backendEnvPath } from './config/env.js';
+import { supabase, supabaseHost } from './config/supabase.js';
 import doctorRouter from './routes/doctorRouter.js';
 import serviceRouter from './routes/serviceRouter.js';
 import appointmentRouter from './routes/appointmentRouter.js';
 import serviceAppointmentRouter from './routes/serviceAppointmentRouter.js';
 import contactRouter from './routes/contactRouter.js';
+import aiRouter from './routes/aiRouter.js';
+import patientProfileRoutes from './routes/patientProfileRoutes.js';
+import adminRouter from './routes/adminRouter.js';
 
 const app = express();
 const port = 4000;
@@ -29,7 +32,7 @@ app.use(cors({
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"]
+    allowedHeaders: ["Content-Type", "Authorization", "X-Admin-Id"]
 }));
 app.use(clerkMiddleware());
 app.use(express.json({ limit: "20mb" }));
@@ -37,11 +40,23 @@ app.use(express.urlencoded({ limit: "20mb", extended: true }));
 
 // Test Supabase connection
 async function testSupabase() {
-    const { error } = await supabase.from('doctors').select('id').limit(1);
-    if (error) {
-        console.error("Supabase connection error:", error.message);
-    } else {
-        console.log("Supabase connected successfully");
+    try {
+        const { error } = await supabase.from('doctors').select('id').limit(1);
+
+        if (error) {
+            const details = error.details ? ` ${error.details}` : "";
+            console.error(`Supabase connection error for ${supabaseHost}: ${error.message}${details}`);
+            console.error(`Verify SUPABASE_URL in ${backendEnvPath} and check your local DNS/VPN/firewall if the host is correct.`);
+            return;
+        }
+
+        console.log(`Supabase connected successfully (${supabaseHost})`);
+    } catch (error) {
+        const causeCode = error?.cause?.code || error?.code || "";
+        if (causeCode === "ENOTFOUND") {
+            console.error(`Supabase DNS lookup failed for ${supabaseHost}. Verify SUPABASE_URL in ${backendEnvPath} and check your internet/DNS/VPN settings.`);
+        }
+        console.error("Supabase startup check failed:", error);
     }
 }
 testSupabase();
@@ -52,6 +67,9 @@ app.use("/api/services", serviceRouter);
 app.use("/api/appointments", appointmentRouter);
 app.use("/api/service-appointments", serviceAppointmentRouter);
 app.use("/api/contact", contactRouter);
+app.use("/api/patient/profile", patientProfileRoutes);
+app.use("/api/ai", aiRouter);
+app.use("/api/admin", adminRouter);
 
 app.get('/', (req, res) => {
     res.send("API Working");

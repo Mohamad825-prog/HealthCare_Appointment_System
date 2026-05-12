@@ -2,14 +2,62 @@ import Stripe from "stripe";
 import { getAuth } from "@clerk/express";
 import { clerkClient } from "@clerk/clerk-sdk-node";
 import { supabase } from "../config/supabase.js";
+import {
+    sendCashPaymentConfirmedEmail,
+    sendAppointmentCreatedEmail,
+    sendAppointmentStatusEmail,
+} from "../utils/email.js";
+import {
+    calculateAgeFromDateOfBirth,
+    fetchPatientProfileByClerkUserId,
+    trimString,
+} from "../utils/patientProfile.js";
 
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
 console.log("Stripe key loaded?", Boolean(process.env.STRIPE_SECRET_KEY));
 const FRONTEND_URL = process.env.FRONTEND_URL;
 const MAJOR_ADMIN_ID = process.env.MAJOR_ADMIN_ID || null;
+const ZERO_DECIMAL_CURRENCIES = new Set([
+    "bif", "clp", "djf", "gnf", "jpy", "kmf", "krw", "mga",
+    "pyg", "rwf", "ugx", "vnd", "vuv", "xaf", "xof", "xpf",
+]);
+
+function normalizeStripeCurrency(value) {
+    const currency = String(value || "usd").trim().toLowerCase();
+    return /^[a-z]{3}$/.test(currency) ? currency : "usd";
+}
+
+const STRIPE_CURRENCY = normalizeStripeCurrency(process.env.STRIPE_CURRENCY || "usd");
+
+function toStripeUnitAmount(amount, currency = STRIPE_CURRENCY) {
+    const numericAmount = Number(amount);
+    if (!Number.isFinite(numericAmount)) return 0;
+    return ZERO_DECIMAL_CURRENCIES.has(normalizeStripeCurrency(currency))
+        ? Math.round(numericAmount)
+        : Math.round(numericAmount * 100);
+}
+
+function fromStripeUnitAmount(amount, currency = STRIPE_CURRENCY) {
+    const numericAmount = Number(amount || 0);
+    return ZERO_DECIMAL_CURRENCIES.has(normalizeStripeCurrency(currency))
+        ? numericAmount
+        : Math.round(numericAmount) / 100;
+}
+
 const stripe = STRIPE_SECRET_KEY
     ? new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2023-10-16" })
     : null;
+// Appointment statuses stay compatible with the existing app:
+// Pending = waiting, Confirmed = accepted, Completed = visit finished, Canceled = rejected/canceled.
+const CANCELED_APPOINTMENT_STATUSES = ["Canceled", "Cancelled"];
+const DECLINED_APPOINTMENT_STATUSES = ["Declined"];
+const CANCELED_STATUS_FILTER = `(${CANCELED_APPOINTMENT_STATUSES.join(",")})`;
+const SLOT_ALREADY_BOOKED_MESSAGE = "This appointment slot is already booked. Please choose another time.";
+const SLOT_JUST_BOOKED_MESSAGE = "This appointment slot was just booked by another patient. Please choose another time.";
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const VALID_PAYMENT_STATUSES = ["Pending", "Paid", "Failed", "Refunded"];
+const columnSupportCache = new Map();
+const columnWarningCache = new Set();
 
 // Helpers
 // Safely parse a value to a number, returning null if it's not a valid number
@@ -17,6 +65,111 @@ const safeNumber = (v) => {
     const n = Number(v);
     return Number.isFinite(n) ? n : null;
 };
+
+const normalizeAppointmentStatus = (status) => String(status || "").trim();
+const normalizePaymentMethod = (method) =>
+    String(method || "").trim().toLowerCase() === "cash" ? "Cash" : "Online";
+const normalizePaymentStatus = (status) => {
+    const incoming = String(status || "").trim();
+    return VALID_PAYMENT_STATUSES.find((item) => item.toLowerCase() === incoming.toLowerCase()) || "Pending";
+};
+const normalizeOptionalEmail = (value) => {
+    const email = String(value || "").trim().toLowerCase();
+    return EMAIL_REGEX.test(email) ? email : "";
+};
+const getAdminNotifyEmail = () => normalizeOptionalEmail(process.env.ADMIN_NOTIFY_EMAIL);
+
+const isCanceledStatus = (status) =>
+    CANCELED_APPOINTMENT_STATUSES.includes(normalizeAppointmentStatus(status));
+
+const isDeclinedStatus = (status) =>
+    DECLINED_APPOINTMENT_STATUSES.includes(normalizeAppointmentStatus(status));
+
+const isCompletedStatus = (status) =>
+    normalizeAppointmentStatus(status) === "Completed";
+
+const isTerminalAppointmentStatus = (status) =>
+    isCompletedStatus(status) || isCanceledStatus(status);
+
+const hasPaymentMutation = (body = {}) =>
+    body.payment !== undefined ||
+    body.paymentStatus !== undefined ||
+    body["payment.status"] !== undefined ||
+    body.paidAt !== undefined ||
+    body.paid_at !== undefined;
+
+function buildPayment({
+    method,
+    status = "Pending",
+    amount = 0,
+    paidAt = null,
+    confirmedBy = null,
+    note = "",
+    providerId = null,
+    extra = {},
+}) {
+    return {
+        ...extra,
+        method: normalizePaymentMethod(method),
+        status: normalizePaymentStatus(status),
+        amount: safeNumber(amount) ?? 0,
+        paidAt,
+        confirmedBy,
+        ...(note ? { note } : {}),
+        ...(providerId ? { providerId } : {}),
+    };
+}
+
+function getPaymentStatus(payment) {
+    return normalizePaymentStatus(payment?.status || "Pending");
+}
+
+function getPaymentMethod(payment) {
+    return normalizePaymentMethod(payment?.method || "Online");
+}
+
+function resolveAdminIdentity(req) {
+    const clerkUserId = resolveClerkUserId(req);
+    if (clerkUserId) {
+        return { id: clerkUserId, verifiedByClerk: true };
+    }
+
+    const headerAdminId = String(req.get("x-admin-id") || "").trim();
+    if (headerAdminId) {
+        return { id: headerAdminId, verifiedByClerk: false };
+    }
+
+    return { id: null, verifiedByClerk: false };
+}
+
+function validateAdminRequest(req, res) {
+    if (!MAJOR_ADMIN_ID) {
+        res.status(500).json({
+            success: false,
+            message: "Admin identity is not configured on the server."
+        });
+        return null;
+    }
+
+    const adminIdentity = resolveAdminIdentity(req);
+    if (!adminIdentity.id) {
+        res.status(401).json({
+            success: false,
+            message: "Admin authorization required."
+        });
+        return null;
+    }
+
+    if (String(adminIdentity.id) !== String(MAJOR_ADMIN_ID)) {
+        res.status(403).json({
+            success: false,
+            message: "Only the configured admin can update cash payment status."
+        });
+        return null;
+    }
+
+    return adminIdentity;
+}
 
 // Build the base URL for frontend links, using environment variable or request headers
 const buildFrontendBase = (req) => {
@@ -72,7 +225,216 @@ function formatAppointment(row, doctorInfo = null) {
         createdAt: row.created_at,
         updatedAt: row.updated_at,
         notes: row.notes || "",
+        patientEmail: row.patient_email || "",
     };
+}
+
+function isMissingColumnError(error, columnName) {
+    const text = [error?.code, error?.message, error?.details, error?.hint]
+        .filter(Boolean)
+        .join(" ");
+
+    return /column .* does not exist|could not find the .* column/i.test(text) &&
+        text.toLowerCase().includes(String(columnName || "").toLowerCase());
+}
+
+async function tableSupportsColumn(tableName, columnName) {
+    const cacheKey = `${tableName}.${columnName}`;
+    if (columnSupportCache.has(cacheKey)) {
+        return columnSupportCache.get(cacheKey);
+    }
+
+    const { error } = await supabase
+        .from(tableName)
+        .select(columnName)
+        .limit(1);
+
+    if (!error) {
+        columnSupportCache.set(cacheKey, true);
+        return true;
+    }
+
+    if (isMissingColumnError(error, columnName)) {
+        if (!columnWarningCache.has(cacheKey)) {
+            columnWarningCache.add(cacheKey);
+            console.warn(`[appointments] ${cacheKey} is not available yet. Run the recommended SQL to enable patient email persistence.`);
+        }
+    } else {
+        console.warn(`[appointments] Unable to verify ${cacheKey}:`, error?.message || error);
+    }
+
+    return false;
+}
+
+async function withPatientEmailIfSupported(payload, emailValue) {
+    const patientEmail = normalizeOptionalEmail(emailValue);
+    if (!patientEmail) return payload;
+
+    const supportsPatientEmail = await tableSupportsColumn("appointments", "patient_email");
+    if (!supportsPatientEmail) return payload;
+
+    return {
+        ...payload,
+        patient_email: patientEmail,
+    };
+}
+
+async function addPatientEmailToUpdatesIfSupported(updates, emailValue) {
+    const patientEmail = normalizeOptionalEmail(emailValue);
+    if (!patientEmail) return updates;
+
+    const supportsPatientEmail = await tableSupportsColumn("appointments", "patient_email");
+    if (!supportsPatientEmail) return updates;
+
+    return {
+        ...updates,
+        patient_email: patientEmail,
+    };
+}
+
+async function notifyAppointmentCreatedEmails(appointment, fallbackEmail = "") {
+    const patientEmail = normalizeOptionalEmail(appointment?.patient_email || fallbackEmail);
+    const adminEmail = getAdminNotifyEmail();
+    const paymentMethod = appointment?.payment?.method || "Online";
+    const commonPayload = {
+        patientName: appointment?.patient_name || "",
+        doctorName: appointment?.doctor_name || "",
+        speciality: appointment?.speciality || "",
+        date: appointment?.date || "",
+        time: appointment?.time || "",
+        fees: appointment?.fees ?? 0,
+        paymentMethod,
+        status: appointment?.status || "",
+        mobile: appointment?.mobile || "",
+        isOnlinePending:
+            paymentMethod === "Online" &&
+            normalizeAppointmentStatus(appointment?.status) === "Pending" &&
+            Number(appointment?.fees || 0) > 0,
+    };
+
+    if (patientEmail) {
+        await sendAppointmentCreatedEmail({
+            to: patientEmail,
+            ...commonPayload,
+        });
+    }
+
+    if (adminEmail) {
+        await sendAppointmentCreatedEmail({
+            to: adminEmail,
+            ...commonPayload,
+            isAdminNotification: true,
+        });
+    }
+}
+
+async function notifyAppointmentStatusEmails({
+    beforeAppointment,
+    afterAppointment,
+    fallbackEmail = "",
+    notifyAdmin = false,
+}) {
+    const beforeStatus = normalizeAppointmentStatus(beforeAppointment?.status);
+    const afterStatus = normalizeAppointmentStatus(afterAppointment?.status);
+    const scheduleChanged =
+        String(beforeAppointment?.date || "") !== String(afterAppointment?.date || "") ||
+        String(beforeAppointment?.time || "") !== String(afterAppointment?.time || "") ||
+        JSON.stringify(beforeAppointment?.rescheduled_to || null) !== JSON.stringify(afterAppointment?.rescheduled_to || null);
+
+    if (!scheduleChanged && beforeStatus === afterStatus) {
+        return;
+    }
+
+    const patientEmail = normalizeOptionalEmail(
+        afterAppointment?.patient_email ||
+        beforeAppointment?.patient_email ||
+        fallbackEmail
+    );
+    const adminEmail = getAdminNotifyEmail();
+    const commonPayload = {
+        patientName: afterAppointment?.patient_name || beforeAppointment?.patient_name || "",
+        doctorName: afterAppointment?.doctor_name || beforeAppointment?.doctor_name || "",
+        speciality: afterAppointment?.speciality || beforeAppointment?.speciality || "",
+        date: afterAppointment?.date || beforeAppointment?.date || "",
+        time: afterAppointment?.time || beforeAppointment?.time || "",
+        previousStatus: beforeStatus || "Unknown",
+        newStatus: afterStatus || "Unknown",
+        rescheduledDate: afterAppointment?.rescheduled_to?.date || "",
+        rescheduledTime: afterAppointment?.rescheduled_to?.time || "",
+        mobile: afterAppointment?.mobile || beforeAppointment?.mobile || "",
+    };
+
+    if (patientEmail) {
+        await sendAppointmentStatusEmail({
+            to: patientEmail,
+            ...commonPayload,
+        });
+    }
+
+    if (notifyAdmin && adminEmail) {
+        await sendAppointmentStatusEmail({
+            to: adminEmail,
+            ...commonPayload,
+            isAdminNotification: true,
+        });
+    }
+}
+
+function isUniqueViolation(error) {
+    const haystack = [
+        error?.code,
+        error?.message,
+        error?.details,
+        error?.hint,
+    ]
+        .filter(Boolean)
+        .join(" ");
+
+    return error?.code === "23505" || /duplicate key value|unique constraint|unique_active_doctor_slot/i.test(haystack);
+}
+
+function createConflictError(message, originalError = null) {
+    const error = new Error(message);
+    error.statusCode = 409;
+    error.originalError = originalError;
+    return error;
+}
+
+async function isSlotAlreadyBooked(doctorId, date, time, excludeAppointmentId = null) {
+    let query = supabase
+        .from("appointments")
+        .select("id")
+        .eq("doctor_id", String(doctorId))
+        .eq("date", String(date))
+        .eq("time", String(time))
+        .not("status", "in", CANCELED_STATUS_FILTER)
+        .limit(1);
+
+    if (excludeAppointmentId) {
+        query = query.neq("id", excludeAppointmentId);
+    }
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    return Array.isArray(data) && data.length > 0;
+}
+
+async function insertAppointmentRecord(payload, conflictMessage = SLOT_JUST_BOOKED_MESSAGE) {
+    const { data, error } = await supabase
+        .from("appointments")
+        .insert(payload)
+        .select()
+        .single();
+
+    if (error) {
+        if (isUniqueViolation(error)) {
+            throw createConflictError(conflictMessage, error);
+        }
+        throw error;
+    }
+
+    return data;
 }
 
 async function getDoctorOwnedAppointment(appointmentId, doctorId) {
@@ -193,15 +555,52 @@ export const createAppointment = async (req, res) => {
         } = req.body || {};
 
         const clerkUserId = resolveClerkUserId(req);
+        const normalizedPatientEmail = normalizeOptionalEmail(email);
         if (!clerkUserId) return res.status(401).json({
             success: false,
             message: "Unauthorized: Unable to resolve user identity."
         });
 
-        if (!doctorId || !patientName || !mobile || !date || !time) {
+        const shouldLoadPatientProfile =
+            !trimString(patientName) ||
+            !trimString(mobile) ||
+            age === undefined ||
+            age === null ||
+            age === "" ||
+            !trimString(gender) ||
+            !normalizedPatientEmail;
+
+        const patientProfile = shouldLoadPatientProfile
+            ? await fetchPatientProfileByClerkUserId(clerkUserId)
+            : null;
+
+        const resolvedPatientName = trimString(patientName) || patientProfile?.fullName || "";
+        const resolvedMobile = trimString(mobile) || patientProfile?.mobile || "";
+        const fallbackAge = patientProfile?.age ?? calculateAgeFromDateOfBirth(patientProfile?.dateOfBirth);
+        const rawResolvedAge =
+            age !== undefined && age !== null && age !== ""
+                ? age
+                : fallbackAge;
+        const resolvedAge =
+            rawResolvedAge === undefined || rawResolvedAge === null || rawResolvedAge === ""
+                ? null
+                : Number(rawResolvedAge);
+        const resolvedGender = trimString(gender) || patientProfile?.gender || "";
+        const resolvedPatientEmail = normalizeOptionalEmail(email || patientProfile?.email || "");
+        const appointmentDate = String(date || "").trim();
+        const appointmentTime = String(time || "").trim();
+
+        if (!doctorId || !resolvedPatientName || !resolvedMobile || !appointmentDate || !appointmentTime) {
             return res.status(400).json({
                 success: false,
                 message: "Missing required fields: doctorId, patientName, mobile, date, and time are required."
+            });
+        }
+
+        if (resolvedAge !== null && (!Number.isFinite(resolvedAge) || resolvedAge < 0 || resolvedAge > 120)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid age: Age must be a reasonable number."
             });
         }
 
@@ -213,21 +612,18 @@ export const createAppointment = async (req, res) => {
             });
         }
 
-        // Duplicate booking prevention
-        const { data: existingBooking, error: dupError } = await supabase
-            .from('appointments')
-            .select('id')
-            .eq('doctor_id', doctorId)
-            .eq('created_by', clerkUserId)
-            .eq('date', String(date))
-            .eq('time', String(time))
-            .neq('status', 'Canceled')
-            .maybeSingle();
+        const normalizedDoctorId = String(doctorId);
 
-        if (existingBooking) {
+        const slotAlreadyBooked = await isSlotAlreadyBooked(
+            normalizedDoctorId,
+            appointmentDate,
+            appointmentTime
+        );
+
+        if (slotAlreadyBooked) {
             return res.status(409).json({
                 success: false,
-                message: "You already have an appointment booked with this doctor at the same date and time."
+                message: SLOT_ALREADY_BOOKED_MESSAGE
             });
         }
 
@@ -236,7 +632,7 @@ export const createAppointment = async (req, res) => {
         const { data: doctorData, error: doctorError } = await supabase
             .from('doctors')
             .select('id, name, specialization, image_url, image_public_id, fee')
-            .eq('id', doctorId)
+            .eq('id', normalizedDoctorId)
             .maybeSingle();
 
         if (doctorError) console.warn("Doctor Lookup Failed:", doctorError?.message);
@@ -258,51 +654,52 @@ export const createAppointment = async (req, res) => {
         const doctorImagePublicId = (doctor.image_public_id && String(doctor.image_public_id).trim()) || (doctorImagePublicIdFromBody && String(doctorImagePublicIdFromBody).trim()) || "";
         const doctorImage = { url: doctorImageUrl, publicId: doctorImagePublicId };
 
-        const base = {
-            doctor_id: String(doctorId),
+        const base = await withPatientEmailIfSupported({
+            doctor_id: normalizedDoctorId,
             doctor_name: doctorName,
             speciality: speciality,
             doctor_image: doctorImage,
-            patient_name: String(patientName).trim(),
-            mobile: String(mobile).trim(),
-            age: age ? Number(age) : null,
-            gender: gender ? String(gender) : "",
-            date: String(date),
-            time: String(time),
+            patient_name: resolvedPatientName,
+            mobile: resolvedMobile,
+            age: resolvedAge,
+            gender: resolvedGender,
+            date: appointmentDate,
+            time: appointmentTime,
             fees: numericFee,
             status: "Pending",
-            payment: { method: paymentMethod === "Cash" ? "Cash" : "Online", status: "Pending", amount: numericFee },
+            payment: buildPayment({
+                method: paymentMethod,
+                status: "Pending",
+                amount: numericFee,
+            }),
             created_by: clerkUserId,
             owner: resolvedOwner,
             session_id: null,
-        };
+        }, resolvedPatientEmail);
 
-        // Free appointment
+        // Free appointments have no collection step. They are confirmed immediately,
+        // while paid cash appointments remain Pending until the admin records payment.
         if (numericFee === 0) {
-            const { data: created, error: insertError } = await supabase
-                .from('appointments')
-                .insert({
-                    ...base,
-                    status: "Confirmed",
-                    payment: { method: base.payment.method, status: "Paid", amount: 0 },
-                    paid_at: new Date().toISOString(),
-                })
-                .select()
-                .single();
-
-            if (insertError) throw insertError;
+            const paidAt = new Date().toISOString();
+            const created = await insertAppointmentRecord({
+                ...base,
+                status: "Confirmed",
+                payment: buildPayment({
+                    method: base.payment.method,
+                    status: "Paid",
+                    amount: 0,
+                    paidAt,
+                }),
+                paid_at: paidAt,
+            });
+            await notifyAppointmentCreatedEmails(created, resolvedPatientEmail);
             return res.status(201).json({ success: true, appointment: formatAppointment(created), checkoutUrl: null });
         }
 
         // Cash payment
         if (paymentMethod === "Cash") {
-            const { data: created, error: insertError } = await supabase
-                .from('appointments')
-                .insert(base)
-                .select()
-                .single();
-
-            if (insertError) throw insertError;
+            const created = await insertAppointmentRecord(base);
+            await notifyAppointmentCreatedEmails(created, resolvedPatientEmail);
             return res.status(201).json({ success: true, appointment: formatAppointment(created), checkoutUrl: null });
         }
 
@@ -317,18 +714,20 @@ export const createAppointment = async (req, res) => {
         const successUrl = `${frontBase}/appointment/success?session_id={CHECKOUT_SESSION_ID}`;
         const cancelUrl = `${frontBase}/appointment/cancel`;
 
+        const stripeUnitAmount = toStripeUnitAmount(numericFee);
+
         let session;
         try {
             session = await stripe.checkout.sessions.create({
                 payment_method_types: ["card"],
                 mode: "payment",
-                customer_email: email || undefined,
+                customer_email: resolvedPatientEmail || undefined,
                 line_items: [
                     {
                         price_data: {
-                            currency: "inr",
+                            currency: STRIPE_CURRENCY,
                             product_data: { name: `Appointment - ${String(patientName).slice(0, 40)}` },
-                            unit_amount: Math.round(numericFee * 100),
+                            unit_amount: stripeUnitAmount,
                         },
                         quantity: 1,
                     },
@@ -342,6 +741,7 @@ export const createAppointment = async (req, res) => {
                     patientName: base.patient_name,
                     mobile: base.mobile,
                     clerkUserId: clerkUserId || "",
+                    currency: STRIPE_CURRENCY,
                 },
             });
         } catch (stripeErr) {
@@ -351,24 +751,31 @@ export const createAppointment = async (req, res) => {
         }
 
         try {
-            const { data: created, error: insertError } = await supabase
-                .from('appointments')
-                .insert({
-                    ...base,
-                    session_id: session.id,
-                    payment: { ...base.payment, providerId: session.payment_intent || session.paymentIntent || null },
+            const created = await insertAppointmentRecord({
+                ...base,
+                session_id: session.id,
+                payment: buildPayment({
+                    method: "Online",
                     status: "Pending",
-                })
-                .select()
-                .single();
-
-            if (insertError) throw insertError;
+                    amount: numericFee,
+                    providerId: session.payment_intent || session.paymentIntent || null,
+                    extra: { ...base.payment, currency: STRIPE_CURRENCY },
+                }),
+                status: "Pending",
+            });
+            await notifyAppointmentCreatedEmails(created, resolvedPatientEmail);
             return res.status(201).json({ success: true, appointment: formatAppointment(created), checkoutUrl: session.url || null });
         } catch (dbErr) {
+            if (dbErr?.statusCode === 409) {
+                throw dbErr;
+            }
             console.error("DB error saving appointment after stripe session:", dbErr);
             return res.status(500).json({ success: false, message: "Failed to create appointment record" });
         }
     } catch (err) {
+        if (err?.statusCode === 409) {
+            return res.status(409).json({ success: false, message: err.message });
+        }
         console.error("createAppointment unexpected:", err);
         return res.status(500).json({ success: false, message: "Server error" });
     }
@@ -411,17 +818,31 @@ export const confirmPayment = async (req, res) => {
             });
         }
 
+        const paidAt = new Date().toISOString();
+        const currency = normalizeStripeCurrency(session.currency || session.metadata?.currency || STRIPE_CURRENCY);
+        const paidAmount = fromStripeUnitAmount(session.amount_total || 0, currency);
+        const paidPayment = buildPayment({
+            method: "Online",
+            status: "Paid",
+            amount: paidAmount,
+            paidAt,
+            providerId: session.payment_intent || null,
+            extra: { currency },
+        });
+
         // Try match by sessionId first
         let { data: appt, error: updateError } = await supabase
             .from('appointments')
             .update({
-                payment: { method: "Online", status: "Paid", amount: Math.round((session.amount_total || 0) / 100), providerId: session.payment_intent || null },
+                payment: paidPayment,
                 status: "Confirmed",
-                paid_at: new Date().toISOString(),
+                paid_at: paidAt,
             })
             .eq('session_id', session_id)
             .select()
-            .single();
+            .maybeSingle();
+
+        if (updateError) throw updateError;
 
         // fallback: try match via metadata (doctorId + mobile + patientName)
         if (!appt) {
@@ -430,37 +851,39 @@ export const confirmPayment = async (req, res) => {
                 const { data: fallbackAppt, error: fallbackError } = await supabase
                     .from('appointments')
                     .update({
-                        payment: { method: "Online", status: "Paid", amount: Math.round((session.amount_total || 0) / 100), providerId: session.payment_intent || null },
+                        payment: paidPayment,
                         status: "Confirmed",
-                        paid_at: new Date().toISOString(),
+                        paid_at: paidAt,
                         session_id: session_id,
                     })
                     .eq('doctor_id', meta.doctorId)
                     .eq('mobile', meta.mobile)
                     .eq('patient_name', meta.patientName)
-                    .eq('fees', Math.round((session.amount_total || 0) / 100))
+                    .eq('fees', paidAmount)
                     .select()
                     .maybeSingle();
+                if (fallbackError) throw fallbackError;
                 appt = fallbackAppt;
             }
         }
 
         // last attempt: find appointment created in last 15 minutes with matching amount
         if (!appt) {
-            const amount = Math.round((session.amount_total || 0) / 100);
+            const amount = paidAmount;
             const fifteenAgo = new Date(Date.now() - 1000 * 60 * 15).toISOString();
             const { data: recentAppt, error: recentError } = await supabase
                 .from('appointments')
                 .update({
-                    payment: { method: "Online", status: "Paid", amount: amount, providerId: session.payment_intent || null },
+                    payment: paidPayment,
                     status: "Confirmed",
-                    paid_at: new Date().toISOString(),
+                    paid_at: paidAt,
                     session_id: session_id,
                 })
                 .eq('fees', amount)
                 .gte('created_at', fifteenAgo)
                 .select()
                 .maybeSingle();
+            if (recentError) throw recentError;
             appt = recentAppt;
         }
 
@@ -468,7 +891,8 @@ export const confirmPayment = async (req, res) => {
             return res.status(404).json({ success: false, message: "Appointment not found for this payment session" });
         }
 
-        return res.json({ success: true, appointment: formatAppointment(appt) });
+        const formatted = formatAppointment(appt);
+        return res.json({ success: true, appointment: formatted, data: formatted });
     } catch (err) {
         console.error("confirmPayment unexpected:", err);
         return res.status(500).json({ success: false, message: "Server error" });
@@ -495,27 +919,52 @@ export const updateAppointment = async (req, res) => {
             throw fetchError;
         }
 
-        const terminal = appt.status === "Completed" || appt.status === "Canceled";
-        if (terminal && body.status && body.status !== appt.status) {
+        const terminal = isTerminalAppointmentStatus(appt.status);
+        if (terminal && body.status && normalizeAppointmentStatus(body.status) !== normalizeAppointmentStatus(appt.status)) {
             return res.status(400).json({ success: false, message: "Cannot change status of a completed/canceled appointment" });
+        }
+        if (hasPaymentMutation(body)) {
+            return res.status(400).json({
+                success: false,
+                message: "Use the admin cash payment endpoint to update payment status."
+            });
         }
 
         const updates = {};
         if (body.status) updates.status = body.status;
+        const fallbackPatientEmail = normalizeOptionalEmail(body.patientEmail || body.email);
 
         if (body.date && body.time) {
-            if (appt.status === "Completed" || appt.status === "Canceled") {
+            if (terminal) {
                 return res.status(400).json({ success: false, message: "Cannot reschedule completed/canceled appointment" });
             }
-            updates.date = body.date;
-            updates.time = body.time;
+            const nextDate = String(body.date).trim();
+            const nextTime = String(body.time).trim();
+            const slotAlreadyBooked = await isSlotAlreadyBooked(
+                appt.doctor_id,
+                nextDate,
+                nextTime,
+                id
+            );
+
+            if (slotAlreadyBooked) {
+                return res.status(409).json({
+                    success: false,
+                    message: SLOT_ALREADY_BOOKED_MESSAGE
+                });
+            }
+
+            updates.date = nextDate;
+            updates.time = nextTime;
             updates.status = "Rescheduled";
-            updates.rescheduled_to = { date: body.date, time: body.time };
+            updates.rescheduled_to = { date: nextDate, time: nextTime };
         }
+
+        const finalUpdates = await addPatientEmailToUpdatesIfSupported(updates, fallbackPatientEmail);
 
         const { data: updated, error: updateError } = await supabase
             .from('appointments')
-            .update(updates)
+            .update(finalUpdates)
             .eq('id', id)
             .select(`
                 *,
@@ -523,7 +972,18 @@ export const updateAppointment = async (req, res) => {
             `)
             .single();
 
-        if (updateError) throw updateError;
+        if (updateError) {
+            if (isUniqueViolation(updateError)) {
+                return res.status(409).json({ success: false, message: SLOT_JUST_BOOKED_MESSAGE });
+            }
+            throw updateError;
+        }
+
+        await notifyAppointmentStatusEmails({
+            beforeAppointment: appt,
+            afterAppointment: updated,
+            fallbackEmail: fallbackPatientEmail,
+        });
 
         return res.json({ success: true, appointment: formatAppointment(updated, updated.doctor) });
     } catch (err) {
@@ -550,6 +1010,17 @@ export const cancelAppointment = async (req, res) => {
             throw fetchError;
         }
 
+        if (isCompletedStatus(appt.status)) {
+            return res.status(400).json({
+                success: false,
+                message: "Cannot cancel a completed appointment"
+            });
+        }
+
+        if (isCanceledStatus(appt.status)) {
+            return res.json({ success: true, appointment: formatAppointment(appt), message: "Appointment is already canceled." });
+        }
+
         const { data: updated, error: updateError } = await supabase
             .from('appointments')
             .update({ status: "Canceled" })
@@ -559,9 +1030,124 @@ export const cancelAppointment = async (req, res) => {
 
         if (updateError) throw updateError;
 
+        await notifyAppointmentStatusEmails({
+            beforeAppointment: appt,
+            afterAppointment: updated,
+            notifyAdmin: true,
+        });
+
         return res.json({ success: true, appointment: formatAppointment(updated) });
     } catch (err) {
         console.error("cancelAppointment unexpected:", err);
+        return res.status(500).json({ success: false, message: "Server error" });
+    }
+};
+
+export const updateCashPaymentStatus = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { paymentStatus, note = "" } = req.body || {};
+        const requestedStatus = normalizePaymentStatus(paymentStatus);
+        const adminIdentity = validateAdminRequest(req, res);
+
+        if (!adminIdentity) return;
+
+        if (requestedStatus !== "Paid") {
+            return res.status(400).json({
+                success: false,
+                message: "Only marking cash payments as Paid is supported by this endpoint."
+            });
+        }
+
+        const { data: appt, error: fetchError } = await supabase
+            .from("appointments")
+            .select("*")
+            .eq("id", id)
+            .maybeSingle();
+
+        if (fetchError) throw fetchError;
+        if (!appt) {
+            return res.status(404).json({
+                success: false,
+                message: "Appointment not found with the provided id."
+            });
+        }
+
+        const currentPayment = appt.payment || {};
+        if (getPaymentMethod(currentPayment) !== "Cash") {
+            return res.status(400).json({
+                success: false,
+                message: "Only cash appointment payments can be manually marked as paid."
+            });
+        }
+
+        if (getPaymentStatus(currentPayment) === "Paid") {
+            return res.json({
+                success: true,
+                message: "Cash payment is already marked as paid.",
+                appointment: formatAppointment(appt)
+            });
+        }
+
+        if (isCanceledStatus(appt.status) || isDeclinedStatus(appt.status)) {
+            return res.status(400).json({
+                success: false,
+                message: "Cannot mark payment as paid for a canceled or declined appointment."
+            });
+        }
+
+        const paidAt = new Date().toISOString();
+        const updatedPayment = buildPayment({
+            method: "Cash",
+            status: "Paid",
+            amount: currentPayment.amount ?? appt.fees ?? 0,
+            paidAt,
+            confirmedBy: adminIdentity.id,
+            note: String(note || "").trim(),
+            extra: currentPayment,
+        });
+
+        const { data: updated, error: updateError } = await supabase
+            .from("appointments")
+            .update({
+                payment: updatedPayment,
+                paid_at: paidAt,
+            })
+            .eq("id", id)
+            .select(`
+                *,
+                doctor:doctor_id ( id, name, specialization, image_url )
+            `)
+            .single();
+
+        if (updateError) throw updateError;
+
+        try {
+            const patientEmail = normalizeOptionalEmail(updated.patient_email || "");
+            if (patientEmail) {
+                await sendCashPaymentConfirmedEmail({
+                    to: patientEmail,
+                    patientName: updated.patient_name || "",
+                    doctorName: updated.doctor_name || updated.doctor?.name || "",
+                    speciality: updated.speciality || updated.doctor?.specialization || "",
+                    date: updated.date || "",
+                    time: updated.time || "",
+                    amount: updatedPayment.amount,
+                    paidAt,
+                    note: updatedPayment.note || "",
+                });
+            }
+        } catch (emailError) {
+            console.warn("Cash payment confirmation email failed:", emailError?.message || emailError);
+        }
+
+        return res.json({
+            success: true,
+            message: "Cash payment marked as paid.",
+            appointment: formatAppointment(updated, updated.doctor)
+        });
+    } catch (err) {
+        console.error("updateCashPaymentStatus unexpected:", err);
         return res.status(500).json({ success: false, message: "Server error" });
     }
 };
@@ -720,16 +1306,23 @@ export const updateDoctorAppointment = async (req, res) => {
             });
         }
 
-        const terminal = appt.status === "Completed" || appt.status === "Canceled";
-        if (terminal && body.status && body.status !== appt.status) {
+        const terminal = isTerminalAppointmentStatus(appt.status);
+        if (terminal && body.status && normalizeAppointmentStatus(body.status) !== normalizeAppointmentStatus(appt.status)) {
             return res.status(400).json({
                 success: false,
                 message: "Cannot change status of a completed/canceled appointment"
             });
         }
+        if (hasPaymentMutation(body)) {
+            return res.status(400).json({
+                success: false,
+                message: "Doctors cannot update payment status."
+            });
+        }
 
         const updates = {};
         if (body.status) updates.status = body.status;
+        const fallbackPatientEmail = normalizeOptionalEmail(body.patientEmail || body.email);
 
         if (body.date && body.time) {
             if (terminal) {
@@ -738,15 +1331,33 @@ export const updateDoctorAppointment = async (req, res) => {
                     message: "Cannot reschedule completed/canceled appointment"
                 });
             }
-            updates.date = body.date;
-            updates.time = body.time;
+            const nextDate = String(body.date).trim();
+            const nextTime = String(body.time).trim();
+            const slotAlreadyBooked = await isSlotAlreadyBooked(
+                doctorId,
+                nextDate,
+                nextTime,
+                id
+            );
+
+            if (slotAlreadyBooked) {
+                return res.status(409).json({
+                    success: false,
+                    message: SLOT_ALREADY_BOOKED_MESSAGE
+                });
+            }
+
+            updates.date = nextDate;
+            updates.time = nextTime;
             updates.status = "Rescheduled";
-            updates.rescheduled_to = { date: body.date, time: body.time };
+            updates.rescheduled_to = { date: nextDate, time: nextTime };
         }
+
+        const finalUpdates = await addPatientEmailToUpdatesIfSupported(updates, fallbackPatientEmail);
 
         const { data: updated, error: updateError } = await supabase
             .from("appointments")
-            .update(updates)
+            .update(finalUpdates)
             .eq("id", id)
             .eq("doctor_id", doctorId)
             .select(`
@@ -755,7 +1366,18 @@ export const updateDoctorAppointment = async (req, res) => {
             `)
             .single();
 
-        if (updateError) throw updateError;
+        if (updateError) {
+            if (isUniqueViolation(updateError)) {
+                return res.status(409).json({ success: false, message: SLOT_JUST_BOOKED_MESSAGE });
+            }
+            throw updateError;
+        }
+
+        await notifyAppointmentStatusEmails({
+            beforeAppointment: appt,
+            afterAppointment: updated,
+            fallbackEmail: fallbackPatientEmail,
+        });
 
         return res.json({ success: true, appointment: formatAppointment(updated, updated.doctor) });
     } catch (err) {
@@ -786,7 +1408,7 @@ export const cancelDoctorAppointment = async (req, res) => {
             });
         }
 
-        if (appt.status === "Completed") {
+        if (isCompletedStatus(appt.status)) {
             return res.status(400).json({
                 success: false,
                 message: "Cannot cancel a completed appointment"
@@ -805,6 +1427,12 @@ export const cancelDoctorAppointment = async (req, res) => {
             .single();
 
         if (updateError) throw updateError;
+
+        await notifyAppointmentStatusEmails({
+            beforeAppointment: appt,
+            afterAppointment: updated,
+            notifyAdmin: true,
+        });
 
         return res.json({ success: true, appointment: formatAppointment(updated, updated.doctor) });
     } catch (err) {
@@ -830,6 +1458,7 @@ export default {
     createAppointment,
     confirmPayment,
     updateAppointment,
+    updateCashPaymentStatus,
     cancelAppointment,
     getStats,
     getAppointmentsByDoctor,
