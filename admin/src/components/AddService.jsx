@@ -260,7 +260,6 @@ const AddService = ({ serviceId }) => {
         if (!about.trim()) newErrors.about = true;
         if (!String(price).trim()) newErrors.price = true;
         if (!instructions.some((ins) => ins.trim())) newErrors.instructions = true;
-        if (!slots.length) newErrors.slots = true;
 
         setErrors(newErrors);
         return Object.keys(newErrors).length === 0;
@@ -603,7 +602,7 @@ const AddService = ({ serviceId }) => {
                                 </div>
                                 <div className="flex items-center gap-2">
                                     <div className="text-sm text-gray-500">
-                                        {slots.length} slot{slots.length !== 1 ? "s" : ""} added
+                                        {slots.length} optional slot{slots.length !== 1 ? "s" : ""} added
                                     </div>
                                 </div>
                             </div>

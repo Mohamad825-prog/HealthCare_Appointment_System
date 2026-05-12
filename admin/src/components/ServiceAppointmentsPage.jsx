@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react'
+import { useAuth, useUser } from '@clerk/clerk-react';
 import { serviceAppointmentsStyles } from '../assets/dummyStyles';
-import { Loader2, SearchIcon, XIcon, DollarSign, User, Phone, Calendar, Clock, CheckCircle, XCircle } from 'lucide-react';
+import { Loader2, SearchIcon, XIcon, DollarSign, User, Phone, Calendar, Clock, CheckCircle, XCircle, CreditCard } from 'lucide-react';
 
 const API_BASE = "http://localhost:4000";
 // Helpers function
@@ -10,7 +11,7 @@ function formatTwo(n) {
 }
 
 function formatDateNice(dateStr) {
-    if (!dateStr) return "";
+    if (!dateStr) return "To be scheduled";
     const d = new Date(`${dateStr}T00:00:00`);
     return d.toLocaleDateString("en-GB", {
         day: "numeric",
@@ -20,7 +21,7 @@ function formatDateNice(dateStr) {
 }
 
 function parseTimeToParts(timeStr) {
-    if (!timeStr) return { hour: 12, minute: 0, ampm: "AM" };
+    if (!timeStr) return { hour: null, minute: null, ampm: "" };
     const m = timeStr.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)?$/i);
     if (m) {
         let hh = Number(m[1]);
@@ -32,7 +33,7 @@ function parseTimeToParts(timeStr) {
         }
         return { hour: hh, minute: mm, ampm };
     }
-    return { hour: 12, minute: 0, ampm: "AM" };
+    return { hour: null, minute: null, ampm: "" };
 }// For time am/pm
 
 function timePartsTo12HourString(hh24, mm) {
@@ -42,6 +43,9 @@ function timePartsTo12HourString(hh24, mm) {
 }
 
 function timePartsToInputValue(a) {
+    if (a.hour === null || a.hour === undefined || a.minute === null || a.minute === undefined || !a.ampm) {
+        return "";
+    }
     const hour = Number(a.hour || 0);
     const minute = Number(a.minute || 0);
     let hh24 = hour % 12;
@@ -53,7 +57,64 @@ function timePartsToInputValue(a) {
 
 // How to display
 function formatTimeDisplay(a) {
+    if (a.hour === null || a.hour === undefined || a.minute === null || a.minute === undefined || !a.ampm) {
+        return "To be scheduled";
+    }
     return `${formatTwo(a.hour)}:${formatTwo(a.minute)} ${a.ampm}`;
+}
+
+function mapServiceAppointment(a) {
+    const hasStoredTime =
+        a.hour !== undefined &&
+        a.hour !== null &&
+        a.minute !== undefined &&
+        a.minute !== null &&
+        a.ampm;
+    const timeStr =
+        a.time ||
+        (a.slot && a.slot.time) ||
+        (hasStoredTime
+            ? `${formatTwo(a.hour)}:${formatTwo(a.minute)} ${a.ampm}`
+            : a.rescheduledTo?.time || "");
+    const parsed = parseTimeToParts(timeStr);
+    const payment = a.payment || {};
+
+    return {
+        id: a._id || a.id,
+        patientName:
+            a.patientName ||
+            a.name ||
+            (a.raw && a.raw.patientName) ||
+            "Unknown",
+        gender: a.gender || (a.raw && a.raw.gender) || "",
+        mobile: a.mobile || a.phone || "",
+        age: a.age || a.raw?.age || "",
+        serviceName:
+            a.serviceName ||
+            a.service ||
+            a.raw?.serviceName ||
+            (a.notes || "").slice(0, 40),
+        fees: a.fees ?? a.fee ?? payment.amount ?? 0,
+        date: a.date || (a.slot && a.slot.date) || a.rescheduledTo?.date || "",
+        hour: parsed.hour,
+        minute: parsed.minute,
+        ampm: parsed.ampm,
+        status: a.status || "Pending",
+        payment,
+        paymentMethod: payment.method || "Online",
+        paymentStatus: payment.status || "Pending",
+        paidAt: a.paidAt || payment.paidAt || null,
+        raw: a,
+    };
+}
+
+function paymentBadgeClasses(status) {
+    const normalized = String(status || "").toLowerCase();
+
+    if (normalized === "paid") return "bg-emerald-50 text-emerald-700 border-emerald-100";
+    if (normalized === "failed") return "bg-rose-50 text-rose-700 border-rose-100";
+    if (normalized === "refunded") return "bg-slate-50 text-slate-700 border-slate-100";
+    return "bg-amber-50 text-amber-700 border-amber-100";
 }
 
 // Status badge component
@@ -243,10 +304,13 @@ function RescheduleButton({ appointment, onReschedule, disabled }) {
 
 const ServiceAppointmentsPage = () => {
 
+    const { getToken } = useAuth();
+    const { user } = useUser();
     const [appointments, setAppointments] = useState([]);
     const [toasts, setToasts] = useState([]);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
+    const [markingPaymentId, setMarkingPaymentId] = useState("");
 
     // Search & debounce
     const [search, setSearch] = useState("");
@@ -292,43 +356,7 @@ const ServiceAppointmentsPage = () => {
                 [];
 
             const normalized = (Array.isArray(list) ? list : [])
-                .map((a) => {
-                    const timeStr =
-                        a.time ||
-                            (a.slot && a.slot.time) ||
-                            (a.hour !== undefined && a.minute !== undefined)
-                            ? `${formatTwo(a.hour || 12)}:${formatTwo(a.minute ?? 0)} ${a.ampm || "AM"
-                            }`
-                            : a.rescheduledTo?.time ||
-                            (a.slot && a.slot.time) ||
-                            a.time ||
-                            "";
-                    const parsed = parseTimeToParts(timeStr);
-                    return {
-                        id: a._id || a.id,
-                        patientName:
-                            a.patientName ||
-                            a.name ||
-                            (a.raw && a.raw.patientName) ||
-                            "Unknown",
-                        gender: a.gender || (a.raw && a.raw.gender) || "",
-                        mobile: a.mobile || a.phone || "",
-                        age: a.age || a.raw?.age || "",
-                        serviceName:
-                            a.serviceName ||
-                            a.service ||
-                            a.raw?.serviceName ||
-                            (a.notes || "").slice(0, 40),
-                        fees: a.fees ?? a.fee ?? a.payment?.amount ?? 0,
-                        date:
-                            a.date || (a.slot && a.slot.date) || a.rescheduledTo?.date || "",
-                        hour: parsed.hour,
-                        minute: parsed.minute,
-                        ampm: parsed.ampm,
-                        status: a.status || (a.payment && a.payment.status) || "Pending",
-                        raw: a,
-                    };
-                })
+                .map(mapServiceAppointment)
                 .filter(Boolean);
             setAppointments(normalized);
         } catch (err) {
@@ -352,6 +380,73 @@ const ServiceAppointmentsPage = () => {
 
     function extractUpdated(body) {
         return body?.data || body?.appointment || body || {};
+    }
+
+    async function getAdminHeaders() {
+        const headers = { "Content-Type": "application/json" };
+
+        try {
+            const token = await getToken?.();
+            if (token) headers.Authorization = `Bearer ${token}`;
+        } catch (tokenError) {
+            console.warn("Unable to read admin Clerk token", tokenError);
+        }
+
+        if (user?.id) {
+            headers["X-Admin-Id"] = user.id;
+        }
+
+        return headers;
+    }
+
+    async function markCashServicePaymentPaid(id) {
+        const appt = appointments.find((x) => x.id === id);
+        if (!appt) return;
+
+        const ok = window.confirm(
+            `Mark cash payment as PAID for ${appt.patientName} - ${appt.serviceName} on ${formatDateNice(appt.date)} at ${formatTimeDisplay(appt)}?`
+        );
+        if (!ok) return;
+
+        setMarkingPaymentId(id);
+        setError(null);
+
+        try {
+            const res = await fetch(`${API_BASE}/api/admin/service-appointments/${id}/payment`, {
+                method: "PATCH",
+                headers: await getAdminHeaders(),
+                body: JSON.stringify({
+                    paymentStatus: "Paid",
+                    note: "Paid at clinic by cash",
+                }),
+            });
+            const body = await res.json().catch(() => ({}));
+            if (!res.ok || body?.success === false) {
+                throw new Error(body?.message || `Payment update failed (${res.status})`);
+            }
+
+            const updated = body?.appointment || body?.data || null;
+            setAppointments((prev) =>
+                prev.map((p) =>
+                    p.id === id
+                        ? updated
+                            ? mapServiceAppointment(updated)
+                            : {
+                                ...p,
+                                paymentStatus: "Paid",
+                                payment: { ...p.payment, status: "Paid" },
+                            }
+                        : p
+                )
+            );
+            pushToast("Payment updated", `Cash payment for appointment #${id} is now Paid`);
+        } catch (err) {
+            console.error("Service cash payment update error:", err);
+            setError(err.message || "Failed to mark service cash payment paid");
+            pushToast("Payment update failed", err.message || "Failed to mark cash payment paid");
+        } finally {
+            setMarkingPaymentId("");
+        }
     }
 
     // To update the status
@@ -389,7 +484,9 @@ const ServiceAppointmentsPage = () => {
             setAppointments((prev) =>
                 prev.map((a) =>
                     a.id === id
-                        ? {
+                        ? updated?.id || updated?._id
+                            ? mapServiceAppointment(updated)
+                            : {
                             ...a,
                             status: updated.status || newStatus,
                             date: updated.date || updated.rescheduledTo?.date || a.date,
@@ -397,19 +494,19 @@ const ServiceAppointmentsPage = () => {
                                 updated.time ||
                                 updated.rescheduledTo?.time ||
                                 a.raw?.time ||
-                                `${formatTwo(a.hour)}:${formatTwo(a.minute)} ${a.ampm}`
+                                formatTimeDisplay(a)
                             ).hour,
                             minute: parseTimeToParts(
                                 updated.time ||
                                 updated.rescheduledTo?.time ||
                                 a.raw?.time ||
-                                `${formatTwo(a.hour)}:${formatTwo(a.minute)} ${a.ampm}`
+                                formatTimeDisplay(a)
                             ).minute,
                             ampm: parseTimeToParts(
                                 updated.time ||
                                 updated.rescheduledTo?.time ||
                                 a.raw?.time ||
-                                `${formatTwo(a.hour)}:${formatTwo(a.minute)} ${a.ampm}`
+                                formatTimeDisplay(a)
                             ).ampm,
                             raw: updated || a.raw,
                         }
@@ -477,14 +574,16 @@ const ServiceAppointmentsPage = () => {
                 updated.time ||
                 updated.rescheduledTo?.time ||
                 timeStr ||
-                `${formatTwo(appt.hour)}:${formatTwo(appt.minute)} ${appt.ampm}`;
+                formatTimeDisplay(appt);
 
             const parsed = parseTimeToParts(finalTimeStr);
 
             setAppointments((prev) =>
                 prev.map((a) =>
                     a.id === id
-                        ? {
+                        ? updated?.id || updated?._id
+                            ? mapServiceAppointment(updated)
+                            : {
                             ...a,
                             date: finalDate,
                             hour: parsed.hour,
@@ -548,11 +647,13 @@ const ServiceAppointmentsPage = () => {
             setAppointments((prev) =>
                 prev.map((a) =>
                     a.id === id
-                        ? {
-                            ...a,
-                            status: updated.status || "Canceled",
-                            raw: updated || a.raw,
-                        }
+                        ? updated?.id || updated?._id
+                            ? mapServiceAppointment(updated)
+                            : {
+                                ...a,
+                                status: updated.status || "Canceled",
+                                raw: updated || a.raw,
+                            }
                         : a
                 )
             );
@@ -691,6 +792,11 @@ const ServiceAppointmentsPage = () => {
                     ) : (
                         displayList.map((a) => {
                             const isLocked = a.status === "Completed" || a.status === "Canceled";
+                            const isCanceled = a.status === "Canceled";
+                            const paymentStatusLower = String(a.paymentStatus || "").toLowerCase();
+                            const isCash = String(a.paymentMethod || "").toLowerCase() === "cash";
+                            const isCashPending = isCash && (paymentStatusLower === "pending" || paymentStatusLower === "unpaid");
+                            const isMarkingPayment = markingPaymentId === a.id;
                             return (
                                 <article key={a.id} className={serviceAppointmentsStyles.article}>
                                     <div className={serviceAppointmentsStyles.cardInner}>
@@ -742,6 +848,13 @@ const ServiceAppointmentsPage = () => {
                                                 </div>
 
                                                 <div className={serviceAppointmentsStyles.detailItem}>
+                                                    <CreditCard className={serviceAppointmentsStyles.detailIcon} />
+                                                    <span className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs font-semibold ${paymentBadgeClasses(a.paymentStatus)}`}>
+                                                        Payment: {a.paymentMethod} - {a.paymentStatus}
+                                                    </span>
+                                                </div>
+
+                                                <div className={serviceAppointmentsStyles.detailItem}>
                                                     <Calendar className={serviceAppointmentsStyles.detailIcon} />
                                                     <span className={serviceAppointmentsStyles.detailText}>
                                                         Date: {formatDateNice(a.date)}
@@ -775,6 +888,18 @@ const ServiceAppointmentsPage = () => {
                                                         disabled={false}
                                                     />
                                                 </div>
+
+                                                {isCashPending && !isCanceled && (
+                                                    <div className="ml-3">
+                                                        <button
+                                                            onClick={() => markCashServicePaymentPaid(a.id)}
+                                                            disabled={Boolean(markingPaymentId)}
+                                                            className="px-3 py-2 rounded-full text-sm flex items-center gap-2 transition bg-emerald-50 text-emerald-700 hover:scale-105 disabled:opacity-60 disabled:cursor-not-allowed"
+                                                        >
+                                                            {isMarkingPayment ? "Marking..." : "Mark Cash Paid"}
+                                                        </button>
+                                                    </div>
+                                                )}
 
                                                 <div className="ml-3">
                                                     <button

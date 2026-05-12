@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react'
+import { useAuth, useUser } from '@clerk/clerk-react';
 import { pageStyles, statusClasses, keyframesStyles } from '../assets/dummyStyles';
-import { Search, Calendar, DollarSign } from 'lucide-react'; 
+import { Search, Calendar, DollarSign, CreditCard } from 'lucide-react';
 
 const API_BASE = "http://localhost:4000";
 
@@ -37,13 +38,58 @@ function dateTimeFromSlot(slot) {
     }
 }
 
+function mapAppointment(a) {
+    const doctorName =
+        (a.doctorId && a.doctorId.name) || a.doctorName || "";
+    const speciality =
+        (a.doctorId && a.doctorId.specialization) ||
+        a.speciality ||
+        a.specialization ||
+        "General";
+    const payment = a.payment || {};
+    const fee = typeof a.fees === "number" ? a.fees : a.fee || payment.amount || 0;
+
+    return {
+        id: a._id || a.id,
+        patientName: a.patientName || "",
+        age: a.age || "",
+        gender: a.gender || "",
+        mobile: a.mobile || "",
+        doctorName,
+        speciality,
+        fee,
+        slot: {
+            date: a.date || (a.slot && a.slot.date) || "",
+            time: a.time || (a.slot && a.slot.time) || "00:00 AM",
+        },
+        status: a.status || "Pending",
+        payment,
+        paymentMethod: payment.method || "Online",
+        paymentStatus: payment.status || "Pending",
+        paidAt: a.paidAt || payment.paidAt || null,
+        raw: a,
+    };
+}
+
+function paymentBadgeClasses(status) {
+    const normalized = String(status || "").toLowerCase();
+
+    if (normalized === "paid") return "bg-emerald-50 text-emerald-700 border-emerald-100";
+    if (normalized === "failed") return "bg-rose-50 text-rose-700 border-rose-100";
+    if (normalized === "refunded") return "bg-slate-50 text-slate-700 border-slate-100";
+    return "bg-amber-50 text-amber-700 border-amber-100";
+}
+
 const AppointmentsPage = () => {
 
     const isAdmin = true; // As the admin is logged in and is Major Admin for response send by him
+    const { getToken } = useAuth();
+    const { user } = useUser();
 
     const [appointments, setAppointments] = useState([]);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
+    const [markingPaymentId, setMarkingPaymentId] = useState("");
 
     const [query, setQuery] = useState("");
     const [filterDate, setFilterDate] = useState("");
@@ -65,32 +111,7 @@ const AppointmentsPage = () => {
                     throw new Error(body?.message || `Failed to fetch (${res.status})`);
                 }
                 const data = await res.json();
-                const items = (data?.appointments || []).map((a) => {
-                    const doctorName =
-                        (a.doctorId && a.doctorId.name) || a.doctorName || "";
-                    const speciality =
-                        (a.doctorId && a.doctorId.specialization) ||
-                        a.speciality ||
-                        a.specialization ||
-                        "General";
-                    const fee = typeof a.fees === "number" ? a.fees : a.fee || 0;
-                    return {
-                        id: a._id || a.id,
-                        patientName: a.patientName || "",
-                        age: a.age || "",
-                        gender: a.gender || "",
-                        mobile: a.mobile || "",
-                        doctorName,
-                        speciality,
-                        fee,
-                        slot: {
-                            date: a.date || (a.slot && a.slot.date) || "",
-                            time: a.time || (a.slot && a.slot.time) || "00:00 AM",
-                        },
-                        status: a.status || (a.payment && a.payment.status) || "Pending",
-                        raw: a, // keep original in case we need it
-                    };
-                });
+                const items = (data?.appointments || []).map(mapAppointment);
                 setAppointments(items); // Set the fetched appointments to state
             } catch (err) {
                 console.error("Load appointments error:", err);
@@ -180,19 +201,7 @@ const AppointmentsPage = () => {
             const updated = data?.appointment || data?.appointments || null;
             if (updated) {
                 setAppointments((prev) =>
-                    prev.map((p) =>
-                        p.id === id
-                            ? {
-                                ...p,
-                                status: updated.status || "Canceled",
-                                slot: {
-                                    date: updated.date || p.slot.date,
-                                    time: updated.time || p.slot.time,
-                                },
-                                raw: updated,
-                            }
-                            : p
-                    )
+                    prev.map((p) => (p.id === id ? mapAppointment(updated) : p))
                 );
             }
         } catch (err) {
@@ -202,31 +211,77 @@ const AppointmentsPage = () => {
                 const reload = await fetch(`${API_BASE}/api/appointments?limit=200`);
                 if (reload.ok) {
                     const body = await reload.json();
-                    const items = (body?.appointments || []).map((a) => ({
-                        id: a._id || a.id,
-                        patientName: a.patientName || "",
-                        age: a.age || "",
-                        gender: a.gender || "",
-                        mobile: a.mobile || "",
-                        doctorName: (a.doctorId && a.doctorId.name) || a.doctorName || "",
-                        speciality:
-                            (a.doctorId && a.doctorId.specialization) ||
-                            a.speciality ||
-                            a.specialization ||
-                            "General",
-                        fee: typeof a.fees === "number" ? a.fees : a.fee || 0,
-                        slot: {
-                            date: a.date || (a.slot && a.slot.date) || "",
-                            time: a.time || (a.slot && a.slot.time) || "00:00 AM",
-                        },
-                        status: a.status || (a.payment && a.payment.status) || "Pending",
-                        raw: a,
-                    }));
+                    const items = (body?.appointments || []).map(mapAppointment);
                     setAppointments(items);
                 }
             } catch (e) {
                 // Ignore reload errors
             }
+        }
+    }
+
+    async function getAdminHeaders() {
+        const headers = { "Content-Type": "application/json" };
+
+        try {
+            const token = await getToken?.();
+            if (token) headers.Authorization = `Bearer ${token}`;
+        } catch (tokenError) {
+            console.warn("Unable to read admin Clerk token", tokenError);
+        }
+
+        if (user?.id) {
+            headers["X-Admin-Id"] = user.id;
+        }
+
+        return headers;
+    }
+
+    async function markCashPaymentPaid(id) {
+        const appt = appointments.find((x) => x.id === id);
+        if (!appt) return;
+
+        const ok = window.confirm(
+            `Mark cash payment as PAID for ${appt.patientName} with ${appt.doctorName} on ${formatDateISO(appt.slot.date)} at ${appt.slot.time}?`
+        );
+        if (!ok) return;
+
+        setMarkingPaymentId(id);
+        setError(null);
+
+        try {
+            const res = await fetch(`${API_BASE}/api/admin/appointments/${id}/payment`, {
+                method: "PATCH",
+                headers: await getAdminHeaders(),
+                body: JSON.stringify({
+                    paymentStatus: "Paid",
+                    note: "Paid at clinic by cash",
+                }),
+            });
+            const body = await res.json().catch(() => ({}));
+            if (!res.ok || body?.success === false) {
+                throw new Error(body?.message || `Payment update failed (${res.status})`);
+            }
+
+            const updated = body?.appointment || null;
+            setAppointments((prev) =>
+                prev.map((p) =>
+                    p.id === id
+                        ? updated
+                            ? mapAppointment(updated)
+                            : {
+                                ...p,
+                                paymentStatus: "Paid",
+                                payment: { ...p.payment, status: "Paid" },
+                            }
+                        : p
+                )
+            );
+        } catch (err) {
+            console.error("Cash payment update error:", err);
+            setError(err.message || "Failed to mark cash payment paid");
+        } finally {
+            setMarkingPaymentId("");
         }
     }
 
@@ -238,7 +293,7 @@ const AppointmentsPage = () => {
                     <div className={pageStyles.headerTitleSection}>
                         <h1 className={pageStyles.headerTitle}>Appointments</h1>
                         <p className={pageStyles.headerSubtitle}>
-                            View and manage all appointments booked by patients. As an admin, you can also cancel appointments if needed.
+                            View appointment status separately from payment status, cancel appointments, and confirm cash payments received at the clinic.
                         </p>
                     </div>
 
@@ -307,6 +362,10 @@ const AppointmentsPage = () => {
                                 statusLower === "canceled" || statusLower === "cancelled";
                             const isCompleted = statusLower === "completed";
                             const isDisabled = isCancelled || isCompleted;
+                            const paymentStatusLower = String(a.paymentStatus || "").toLowerCase();
+                            const isCash = String(a.paymentMethod || "").toLowerCase() === "cash";
+                            const isCashPending = isCash && (paymentStatusLower === "pending" || paymentStatusLower === "unpaid");
+                            const isMarkingPayment = markingPaymentId === a.id;
 
                             return (
                                 <div
@@ -340,6 +399,12 @@ const AppointmentsPage = () => {
                                                     {a.speciality}
                                                 </span>
                                             </div>
+                                            <div className="mt-2 flex flex-wrap items-center gap-2">
+                                                <span className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs font-semibold ${paymentBadgeClasses(a.paymentStatus)}`}>
+                                                    <CreditCard size={13} />
+                                                    Payment: {a.paymentMethod} - {a.paymentStatus}
+                                                </span>
+                                            </div>
                                         </div>
 
                                         <div className="text-right">
@@ -367,7 +432,16 @@ const AppointmentsPage = () => {
                                             {a.status ? a.status.toUpperCase() : "PENDING"}
                                         </div>
 
-                                        <div className="flex items-center gap-2">
+                                        <div className="flex items-center gap-2 flex-wrap">
+                                            {isCashPending && !isCancelled && (
+                                                <button
+                                                    onClick={() => markCashPaymentPaid(a.id)}
+                                                    disabled={Boolean(markingPaymentId)}
+                                                    className="px-3 py-2 rounded-full text-sm flex items-center gap-2 transition bg-emerald-50 text-emerald-700 hover:scale-105 disabled:opacity-60 disabled:cursor-not-allowed"
+                                                >
+                                                    {isMarkingPayment ? "Marking..." : "Mark Cash Paid"}
+                                                </button>
+                                            )}
                                             {isAdmin && (
                                                 <button
                                                     onClick={() => adminCancelAppointment(a.id)}
