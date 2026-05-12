@@ -51,14 +51,29 @@ const formatDate = (value) => {
 
 const formatCurrency = (value) => `$${Number(value || 0).toFixed(0)}`;
 
-const getPaymentSummary = (payment, fees) => {
-    if (!payment) return `Unspecified - ${formatCurrency(fees)}`;
+const getPaymentSummary = (payment) => {
+    if (!payment) return `Unspecified - Pending`;
 
     const method = payment.method || "Payment";
     const status = payment.status || "Pending";
-    const amount = payment.amount ?? fees ?? 0;
 
-    return `${method} - ${status} - ${formatCurrency(amount)}`;
+    return `${method} - ${status}`;
+};
+
+const getPaymentBadgeClasses = (status) => {
+    const normalized = String(status || "").toLowerCase();
+
+    if (normalized === "paid") {
+        return "bg-emerald-100 text-emerald-700 border-emerald-200";
+    }
+    if (normalized === "failed") {
+        return "bg-rose-100 text-rose-700 border-rose-200";
+    }
+    if (normalized === "refunded") {
+        return "bg-slate-100 text-slate-700 border-slate-200";
+    }
+
+    return "bg-amber-100 text-amber-700 border-amber-200";
 };
 
 const getStatusBadgeClasses = (status) => {
@@ -216,6 +231,8 @@ const DoctorDashboard = () => {
                 appointment.time,
                 appointment.notes,
                 appointment.status,
+                appointment.payment?.method,
+                appointment.payment?.status,
             ]
                 .filter(Boolean)
                 .join(" ")
@@ -237,8 +254,8 @@ const DoctorDashboard = () => {
         ).length;
         const earnings = appointments
             .filter((item) => {
-                const normalized = String(item.status || "").toLowerCase();
-                return normalized === "confirmed" || normalized === "completed";
+                const normalized = String(item.payment?.status || "").toLowerCase();
+                return normalized === "paid";
             })
             .reduce((sum, item) => sum + Number(item.fees || 0), 0);
 
@@ -633,12 +650,15 @@ const DoctorDashboard = () => {
                                                                     <CreditCard className="w-4 h-4 text-emerald-600" />
                                                                     {formatCurrency(appointment.fees)}
                                                                 </p>
-                                                                <p className="mt-1 text-slate-500 text-xs sm:text-sm">
-                                                                    {getPaymentSummary(
-                                                                        appointment.payment,
-                                                                        appointment.fees
-                                                                    )}
-                                                                </p>
+                                                                <div className="mt-2 flex flex-wrap gap-2">
+                                                                    <span
+                                                                        className={`inline-flex rounded-full border px-2.5 py-1 text-xs font-semibold ${getPaymentBadgeClasses(
+                                                                            appointment.payment?.status
+                                                                        )}`}
+                                                                    >
+                                                                        Payment: {getPaymentSummary(appointment.payment)}
+                                                                    </span>
+                                                                </div>
                                                             </div>
 
                                                             <div className="rounded-2xl border border-white bg-white px-4 py-3">

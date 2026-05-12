@@ -10,8 +10,7 @@ import {
 import Navbar from '../components/Navbar'
 import Footer from '../components/Footer'
 import { homePageStyles as hs } from '../assets/dummyStyles'
-
-const API_BASE = 'http://localhost:4000'
+import { API_BASE, getPatientProfile } from '../services/patientProfileApi'
 
 // ── Tiny helpers ──────────────────────────────────────────────────────────────
 
@@ -89,6 +88,7 @@ const DoctorDetail = () => {
   const [selectedTime, setSelectedTime] = useState('')
   const [form, setForm] = useState({
     patientName: '',
+    email: '',
     mobile: '',
     age: '',
     gender: 'Male',
@@ -125,10 +125,47 @@ const DoctorDetail = () => {
 
   // Pre-fill name from Clerk user
   useEffect(() => {
-    if (user?.fullName) {
-      setForm(prev => ({ ...prev, patientName: prev.patientName || user.fullName }))
+    if (user?.fullName || user?.primaryEmailAddress?.emailAddress) {
+      setForm(prev => ({
+        ...prev,
+        patientName: prev.patientName || user?.fullName || '',
+        email: prev.email || user?.primaryEmailAddress?.emailAddress || '',
+      }))
     }
   }, [user])
+
+  useEffect(() => {
+    if (!isLoaded || !isSignedIn) return
+
+    let cancelled = false
+
+    const run = async () => {
+      try {
+        const profile = await getPatientProfile(getToken)
+        if (!profile || cancelled) return
+
+        setForm(prev => ({
+          ...prev,
+          patientName: prev.patientName || profile.fullName || '',
+          email: prev.email || profile.email || user?.primaryEmailAddress?.emailAddress || '',
+          mobile: prev.mobile || profile.mobile || '',
+          age: prev.age || (profile.age != null ? String(profile.age) : ''),
+          gender:
+            prev.gender && prev.gender !== 'Male'
+              ? prev.gender
+              : (profile.gender || prev.gender || 'Male'),
+        }))
+      } catch {
+        // Keep booking available even if profile loading fails.
+      }
+    }
+
+    run()
+
+    return () => {
+      cancelled = true
+    }
+  }, [getToken, isLoaded, isSignedIn, user])
 
   // ── Derived data ──────────────────────────────────────────────────────────────
   const futureDates = useMemo(() => {
@@ -172,7 +209,7 @@ const DoctorDetail = () => {
     setBookingError(null)
     try {
       const token = await getToken()
-      const email = user?.primaryEmailAddress?.emailAddress || ''
+      const email = form.email.trim() || user?.primaryEmailAddress?.emailAddress || ''
       const res = await fetch(`${API_BASE}/api/appointments`, {
         method: 'POST',
         headers: {
@@ -496,6 +533,21 @@ const DoctorDetail = () => {
                                 onChange={handleField}
                                 placeholder="e.g. John Smith"
                                 required
+                                className="w-full px-4 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-emerald-400 focus:border-transparent transition"
+                              />
+                            </div>
+
+                            {/* Email */}
+                            <div className="sm:col-span-2">
+                              <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">
+                                Email Address
+                              </label>
+                              <input
+                                name="email"
+                                type="email"
+                                value={form.email}
+                                onChange={handleField}
+                                placeholder="e.g. john@example.com"
                                 className="w-full px-4 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-emerald-400 focus:border-transparent transition"
                               />
                             </div>

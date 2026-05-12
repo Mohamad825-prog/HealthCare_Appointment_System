@@ -2,7 +2,7 @@ import React, { useEffect } from 'react'
 import { navbarStyles } from '../assets/dummyStyles'
 import { useRef, useState } from 'react'
 import { useLocation, Link } from 'react-router-dom'
-import { SignedIn, SignedOut, useClerk, UserButton } from '@clerk/clerk-react'
+import { SignedIn, SignedOut, useAuth, useClerk, UserButton } from '@clerk/clerk-react'
 import { User } from 'lucide-react'
 import logo from '../assets/logo.png'
 import { Key } from 'lucide-react'
@@ -23,6 +23,7 @@ const Navbar = () => {
     const location = useLocation();
     const navRef = useRef(null);
     const clerk = useClerk();
+    const { isSignedIn } = useAuth();
 
 
     // Hide and show navbar on scroll
@@ -76,6 +77,9 @@ const Navbar = () => {
         { label: "Appointments", href: "/appointments" },
         { label: "Contact", href: "/contact" },
     ];
+    if (isSignedIn) {
+        navItems.splice(4, 0, { label: "My Profile", href: "/profile" });
+    }
     const doctorAdminHref = isDoctorLoggedIn
         ? "/doctor-admin/dashboard"
         : "/doctor-admin/login";

@@ -7,6 +7,7 @@ import Appointments from './pages/Appointments'
 import Contact from './pages/Contact'
 import DoctorDetail from './pages/DoctorDetail'
 import ServiceDetail from './pages/ServiceDetail'
+import Profile from './pages/Profile'
 import AppointmentSuccess from './pages/AppointmentSuccess'
 import AppointmentCancel from './pages/AppointmentCancel'
 import ServiceAppointmentSuccess from './pages/ServiceAppointmentSuccess'
@@ -39,10 +40,25 @@ const persistPositions = (positions) => {
   }
 }
 
+const isReloadNavigation = () => {
+  if (typeof window === 'undefined') return false
+
+  const navigationEntry = window.performance
+    ?.getEntriesByType?.('navigation')
+    ?.at(0)
+
+  if (navigationEntry?.type) {
+    return navigationEntry.type === 'reload'
+  }
+
+  return window.performance?.navigation?.type === 1
+}
+
 const ScrollManager = () => {
   const { key } = useLocation()
   const navigationType = useNavigationType()
   const positions = useRef(loadStoredPositions())
+  const shouldForceTopOnLoad = useRef(isReloadNavigation())
 
   useEffect(() => {
     if (!('scrollRestoration' in window.history)) return undefined
@@ -89,7 +105,7 @@ const ScrollManager = () => {
     }
 
     frameId = window.requestAnimationFrame(() => {
-      if (navigationType === 'POP') {
+      if (!shouldForceTopOnLoad.current && navigationType === 'POP') {
         const savedPosition = positions.current[key]
 
         if (typeof savedPosition === 'number') {
@@ -98,6 +114,7 @@ const ScrollManager = () => {
         }
       }
 
+      shouldForceTopOnLoad.current = false
       window.scrollTo(0, 0)
     })
 
@@ -118,6 +135,7 @@ const App = () => {
         <Route path="/services" element={<Services />} />
         <Route path="/services/:id" element={<ServiceDetail />} />
         <Route path="/appointments" element={<Appointments />} />
+        <Route path="/profile" element={<Profile />} />
         <Route path="/contact" element={<Contact />} />
         <Route path="/appointment/success" element={<AppointmentSuccess />} />
         <Route path="/appointment/cancel" element={<AppointmentCancel />} />

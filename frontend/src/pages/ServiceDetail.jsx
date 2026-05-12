@@ -9,8 +9,7 @@ import {
 import Navbar from '../components/Navbar'
 import Footer from '../components/Footer'
 import { homePageStyles as hs } from '../assets/dummyStyles'
-
-const API_BASE = 'http://localhost:4000'
+import { API_BASE, getPatientProfile } from '../services/patientProfileApi'
 
 // ── Tiny helpers ──────────────────────────────────────────────────────────────
 
@@ -74,6 +73,7 @@ const ServiceDetail = () => {
   const [selectedTime, setSelectedTime] = useState('')
   const [form, setForm] = useState({
     patientName: '',
+    email: '',
     mobile: '',
     age: '',
     gender: 'Male',
@@ -82,6 +82,7 @@ const ServiceDetail = () => {
   const [booking, setBooking]           = useState(false)
   const [bookingError, setBookingError] = useState(null)
   const [bookingSuccess, setBookingSuccess] = useState(false)
+  const [bookingSuccessMessage, setBookingSuccessMessage] = useState('')
 
   // ── Fetch service ─────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -112,10 +113,47 @@ const ServiceDetail = () => {
 
   // Pre-fill name from Clerk user
   useEffect(() => {
-    if (user?.fullName) {
-      setForm(prev => ({ ...prev, patientName: prev.patientName || user.fullName }))
+    if (user?.fullName || user?.primaryEmailAddress?.emailAddress) {
+      setForm(prev => ({
+        ...prev,
+        patientName: prev.patientName || user?.fullName || '',
+        email: prev.email || user?.primaryEmailAddress?.emailAddress || '',
+      }))
     }
   }, [user])
+
+  useEffect(() => {
+    if (!isLoaded || !isSignedIn) return
+
+    let cancelled = false
+
+    const run = async () => {
+      try {
+        const profile = await getPatientProfile(getToken)
+        if (!profile || cancelled) return
+
+        setForm(prev => ({
+          ...prev,
+          patientName: prev.patientName || profile.fullName || '',
+          email: prev.email || profile.email || user?.primaryEmailAddress?.emailAddress || '',
+          mobile: prev.mobile || profile.mobile || '',
+          age: prev.age || (profile.age != null ? String(profile.age) : ''),
+          gender:
+            prev.gender && prev.gender !== 'Male'
+              ? prev.gender
+              : (profile.gender || prev.gender || 'Male'),
+        }))
+      } catch {
+        // Keep booking available even if profile loading fails.
+      }
+    }
+
+    run()
+
+    return () => {
+      cancelled = true
+    }
+  }, [getToken, isLoaded, isSignedIn, user])
 
   // ── Derived data ──────────────────────────────────────────────────────────────
   const futureDates = useMemo(() => {
@@ -125,6 +163,8 @@ const ServiceDetail = () => {
       .filter(d => d >= today && Array.isArray(service.slots[d]) && service.slots[d].length > 0)
       .sort()
   }, [service])
+
+  const hasScheduledSlots = futureDates.length > 0
 
   const timeSlots = useMemo(() => {
     if (!selectedDate || !service?.slots) return []
@@ -149,14 +189,15 @@ const ServiceDetail = () => {
     e.preventDefault()
     if (!form.patientName.trim()) { setBookingError('Please enter the patient full name.'); return }
     if (!form.mobile.trim())      { setBookingError('Please enter a mobile number.'); return }
-    if (!selectedDate)            { setBookingError('Please select an appointment date.'); return }
-    if (!selectedTime)            { setBookingError('Please select a time slot.'); return }
+    if (hasScheduledSlots && !selectedDate) { setBookingError('Please select an appointment date.'); return }
+    if (hasScheduledSlots && !selectedTime) { setBookingError('Please select a time slot.'); return }
 
     setBooking(true)
     setBookingError(null)
+    setBookingSuccessMessage('')
     try {
       const token = await getToken()
-      const email = user?.primaryEmailAddress?.emailAddress || ''
+      const email = form.email.trim() || user?.primaryEmailAddress?.emailAddress || ''
       const res = await fetch(`${API_BASE}/api/service-appointments`, {
         method: 'POST',
         headers: {
@@ -170,8 +211,9 @@ const ServiceDetail = () => {
           mobile: form.mobile.trim(),
           age: form.age || '',
           gender: form.gender,
-          date: selectedDate,
-          time: selectedTime,        // backend parses into hour/minute/ampm
+          date: hasScheduledSlots ? selectedDate : undefined,
+          time: hasScheduledSlots ? selectedTime : undefined,
+          flexibleScheduling: !hasScheduledSlots,
           fees: service.price ?? 0,
           amount: service.price ?? 0,
           paymentMethod: form.paymentMethod,
@@ -184,6 +226,15 @@ const ServiceDetail = () => {
       if (json.checkoutUrl) {
         window.location.href = json.checkoutUrl
       } else {
+        const payment = json.appointment?.payment || {}
+        const isFree = Number(payment.amount ?? service.price ?? 0) === 0 && payment.status === 'Paid'
+        setBookingSuccessMessage(
+          isFree
+            ? 'This free service has no payment due. Redirecting to your appointments...'
+            : payment.method === 'Cash'
+              ? 'Cash payment is pending. Please pay at the clinic. Redirecting to your appointments...'
+              : 'Redirecting to your appointments...'
+        )
         setBookingSuccess(true)
         setTimeout(() => navigate('/appointments'), 2200)
       }
@@ -328,12 +379,15 @@ const ServiceDetail = () => {
                   <div className="bg-white rounded-2xl shadow-sm border border-teal-100 p-5">
                     <h3 className="font-semibold text-gray-700 flex items-center gap-2 mb-4 text-sm">
                       <CalendarDays className="w-4 h-4 text-teal-500" />
-                      Select a Date
+                      {hasScheduledSlots ? 'Select a Date' : 'Scheduling'}
                     </h3>
-                    {futureDates.length === 0 ? (
+                    {!hasScheduledSlots ? (
                       <div className="text-center py-8">
                         <span className="text-4xl">📅</span>
-                        <p className="text-gray-400 text-sm mt-3">No available slots at the moment</p>
+                        <p className="text-gray-700 text-sm font-semibold mt-3">Flexible scheduling</p>
+                        <p className="text-gray-400 text-sm mt-2">
+                          Submit your request now. The clinic will contact you to schedule the date and time.
+                        </p>
                       </div>
                     ) : (
                       <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
@@ -435,7 +489,9 @@ const ServiceDetail = () => {
                         <div className="flex flex-col items-center justify-center py-10 text-center">
                           <CheckCircle className="w-14 h-14 text-teal-500 mb-4" />
                           <h3 className="text-gray-800 font-semibold text-xl mb-1">Appointment Booked!</h3>
-                          <p className="text-gray-500 text-sm">Redirecting to your appointments…</p>
+                          <p className="text-gray-500 text-sm">
+                            {bookingSuccessMessage || 'Redirecting to your appointments...'}
+                          </p>
                         </div>
                       )}
 
@@ -444,6 +500,14 @@ const ServiceDetail = () => {
                         <form onSubmit={handleBook} className="space-y-4">
 
                           {/* Selected slot summary */}
+                          {!hasScheduledSlots && (
+                            <div className="bg-teal-50 border border-teal-200 rounded-xl px-4 py-3 text-sm">
+                              <p className="text-teal-700 font-medium">
+                                This service does not require choosing a slot now.
+                              </p>
+                            </div>
+                          )}
+
                           {(selectedDate || selectedTime) && (
                             <div className="bg-teal-50 border border-teal-200 rounded-xl px-4 py-3 text-sm">
                               <p className="text-teal-700 font-medium">
@@ -466,6 +530,21 @@ const ServiceDetail = () => {
                                 onChange={handleField}
                                 placeholder="e.g. Jane Doe"
                                 required
+                                className="w-full px-4 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-teal-400 focus:border-transparent transition"
+                              />
+                            </div>
+
+                            {/* Email */}
+                            <div className="sm:col-span-2">
+                              <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">
+                                Email Address
+                              </label>
+                              <input
+                                name="email"
+                                type="email"
+                                value={form.email}
+                                onChange={handleField}
+                                placeholder="e.g. jane@example.com"
                                 className="w-full px-4 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-teal-400 focus:border-transparent transition"
                               />
                             </div>
@@ -569,7 +648,7 @@ const ServiceDetail = () => {
                             )}
                           </button>
 
-                          {!selectedDate && (
+                          {hasScheduledSlots && !selectedDate && (
                             <p className="text-xs text-center text-gray-400">
                               ← Select a date and time slot on the left to continue
                             </p>

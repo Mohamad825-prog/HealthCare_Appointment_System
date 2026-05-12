@@ -16,7 +16,7 @@ const API_BASE = 'http://localhost:4000'
 // ── Date / time helpers ────────────────────────────────────────────────────────
 
 const formatDate = (dateStr) => {
-  if (!dateStr) return 'N/A'
+  if (!dateStr) return 'To be scheduled'
   const d = new Date(dateStr + 'T00:00:00')
   return d.toLocaleDateString('en-US', {
     weekday: 'short', month: 'short', day: 'numeric', year: 'numeric',
@@ -24,19 +24,21 @@ const formatDate = (dateStr) => {
 }
 
 const formatServiceTime = (apt) => {
-  if (apt.hour == null) return 'N/A'
+  if (apt.hour == null || apt.minute == null || !apt.ampm) return 'To be scheduled'
   const mm = String(apt.minute ?? 0).padStart(2, '0')
   return `${apt.hour}:${mm} ${apt.ampm ?? ''}`
 }
 
 const isUpcoming = (apt) => {
   if (apt.status === 'Canceled' || apt.status === 'Completed') return false
+  if (!apt.date) return true
   return new Date(apt.date + 'T23:59:59') >= new Date()
 }
 
 const isPast = (apt) => {
   if (apt.status === 'Canceled') return false
   if (apt.status === 'Completed') return true
+  if (!apt.date) return false
   return new Date(apt.date + 'T00:00:00') < new Date()
 }
 
@@ -62,30 +64,41 @@ const StatusBadge = ({ status }) => {
 
 const PaymentBadge = ({ payment }) => {
   if (!payment) return null
-  const { method, status, amount } = payment
-  const isOnline   = method === 'Online'
-  const isPaid     = status === 'Paid' || status === 'Confirmed'
-  const isRefunded = status === 'Refunded'
-  const isCanceled = status === 'Canceled'
+  const { amount } = payment
+  const method = payment.method || 'Online'
+  const status = payment.status || 'Pending'
+  const normalizedMethod = String(method).toLowerCase()
+  const normalizedStatus = String(status).toLowerCase()
+  const isOnline   = normalizedMethod === 'online'
+  const isCash     = normalizedMethod === 'cash'
+  const isPaid     = normalizedStatus === 'paid'
+  const isRefunded = normalizedStatus === 'refunded'
+  const isFailed   = normalizedStatus === 'failed'
+  const isPending  = normalizedStatus === 'pending' || normalizedStatus === 'unpaid'
 
   if (isRefunded) return (
     <span className="text-xs font-medium px-2.5 py-1 rounded-full bg-purple-100 text-purple-600 border border-purple-200">
       💳 Refunded
     </span>
   )
-  if (isCanceled) return (
+  if (isFailed) return (
     <span className="text-xs font-medium px-2.5 py-1 rounded-full bg-rose-50 text-rose-500 border border-rose-200">
-      💳 Payment Canceled
+      Online - Payment Failed
     </span>
   )
   if (isPaid) return (
     <span className="text-xs font-medium px-2.5 py-1 rounded-full bg-emerald-50 text-emerald-600 border border-emerald-200">
-      ✓ Paid {isOnline ? 'Online' : 'Cash'} · ${amount ?? 0}
+      {isCash ? 'Cash - Paid' : isOnline ? 'Online - Paid' : 'Paid'} · ${amount ?? 0}
     </span>
   )
-  if (isOnline) return (
+  if (isCash && isPending) return (
     <span className="text-xs font-medium px-2.5 py-1 rounded-full bg-amber-50 text-amber-600 border border-amber-200">
-      ⏳ Payment Pending
+      Cash - Pay at clinic · ${amount ?? 0}
+    </span>
+  )
+  if (isOnline && isPending) return (
+    <span className="text-xs font-medium px-2.5 py-1 rounded-full bg-amber-50 text-amber-600 border border-amber-200">
+      Online - Payment Pending
     </span>
   )
   return (

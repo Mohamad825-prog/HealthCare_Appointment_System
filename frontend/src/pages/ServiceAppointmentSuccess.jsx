@@ -10,14 +10,14 @@ import Footer from '../components/Footer'
 const API_BASE = 'http://localhost:4000'
 
 const formatLongDate = (dateStr) => {
-  if (!dateStr) return 'N/A'
+  if (!dateStr) return 'To be scheduled'
   return new Date(dateStr + 'T00:00:00').toLocaleDateString('en-US', {
     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
   })
 }
 
 const formatServiceTime = (apt) => {
-  if (!apt || apt.hour == null) return 'N/A'
+  if (!apt || apt.hour == null || apt.minute == null || !apt.ampm) return 'To be scheduled'
   const mm = String(apt.minute ?? 0).padStart(2, '0')
   return `${apt.hour}:${mm} ${apt.ampm ?? ''}`
 }
@@ -112,6 +112,9 @@ const ServiceAppointmentSuccess = () => {
                     <span>✓</span>
                     <span>
                       Amount Paid: ${appointment.payment?.amount ?? appointment.fees ?? 0}
+                    </span>
+                    <span className="text-teal-700">
+                      ({appointment.payment?.method || 'Online'} - {appointment.payment?.status || 'Paid'})
                     </span>
                   </div>
                 </div>

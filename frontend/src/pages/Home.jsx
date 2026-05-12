@@ -11,6 +11,9 @@ import Navbar from '../components/Navbar'
 import Footer from '../components/Footer'
 import DoctorsPreview from '../components/DoctorsPreview'
 import ServicesPreview from '../components/ServicesPreview'
+import SymptomChecker from '../components/SymptomChecker'
+import DoctorRecommendationHelper from '../components/DoctorRecommendationHelper'
+import FAQChatbot from '../components/FAQChatbot'
 import { homePageStyles as hs } from '../assets/dummyStyles'
 
 import BannerImg from '../assets/BannerImg.jpg'
@@ -371,6 +374,12 @@ const Home = () => {
           </div>
         </div>
       </section>
+
+      <SymptomChecker />
+
+      <DoctorRecommendationHelper />
+
+      <FAQChatbot />
 
       {/* ── Doctors Preview ─────────────────────────────────────────────── */}
       <DoctorsPreview />
