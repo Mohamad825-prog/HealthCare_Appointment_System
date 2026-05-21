@@ -1,4 +1,5 @@
 import React, { useState } from 'react'
+import { useAuth } from '@clerk/clerk-react'
 import { Link } from 'react-router-dom'
 import {
   Phone, Mail, MapPin, Send,
@@ -36,6 +37,15 @@ const socialLinks = [
 const Footer = () => {
   const [email, setEmail] = useState('')
   const [subscribed, setSubscribed] = useState(false)
+  const { isSignedIn } = useAuth()
+
+  const visibleQuickLinks = isSignedIn
+    ? [
+        ...quickLinks.slice(0, 4),
+        { label: 'My Profile', href: '/profile' },
+        ...quickLinks.slice(4),
+      ]
+    : quickLinks
 
   const handleSubscribe = (e) => {
     e.preventDefault()
@@ -101,7 +111,7 @@ const Footer = () => {
           <div className={s.linksSection}>
             <h3 className={s.sectionTitle}>Quick Links</h3>
             <ul className={s.linksList}>
-              {quickLinks.map((link) => (
+              {visibleQuickLinks.map((link) => (
                 <li key={link.href} className={s.linkItem}>
                   <Link to={link.href} className={s.quickLink}>
                     <span className={s.quickLinkIconWrapper}>
@@ -181,7 +191,7 @@ const Footer = () => {
                   className={`${s.socialLink} ${colorClass}`}
                 >
                   <span className={s.socialIconBackground} />
-                  <Icon className={s.socialIcon} />
+                  {React.createElement(Icon, { className: s.socialIcon })}
                 </a>
               ))}
             </div>
