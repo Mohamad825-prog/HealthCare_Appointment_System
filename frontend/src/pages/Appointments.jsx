@@ -1,10 +1,10 @@
 import React, { useEffect, useState, useMemo, useRef } from 'react'
 import { Link } from 'react-router-dom'
-import { useAuth, useClerk, SignedIn, SignedOut } from '@clerk/clerk-react'
+import { useAuth, useClerk } from '@clerk/clerk-react'
 import {
   CalendarDays, Clock, CreditCard, User,
   Stethoscope, Activity, Lock, RefreshCw, XCircle,
-  Phone, AlertCircle,
+  Phone, FileText, Download, X, AlertCircle,
 } from 'lucide-react'
 
 import Navbar from '../components/Navbar'
@@ -110,6 +110,92 @@ const PaymentBadge = ({ payment }) => {
 
 // ── Skeleton card ──────────────────────────────────────────────────────────────
 
+const normalizeResultFromApi = (result) => {
+  if (!result) return null
+
+  return {
+    id: result.id || result._id || '',
+    serviceAppointmentId: result.serviceAppointmentId || result.service_appointment_id || '',
+    resultTitle: result.resultTitle || result.result_title || '',
+    resultSummary: result.resultSummary || result.result_summary || '',
+    resultValues: result.resultValues ?? result.result_values ?? null,
+    resultFileUrl: result.resultFileUrl || result.result_file_url || '',
+    resultStatus: result.resultStatus || result.result_status || '',
+    createdAt: result.createdAt || result.created_at || '',
+    updatedAt: result.updatedAt || result.updated_at || '',
+  }
+}
+
+const formatDateTime = (value) => {
+  if (!value) return ''
+
+  try {
+    return new Date(value).toLocaleString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+    })
+  } catch {
+    return ''
+  }
+}
+
+const ResultStatusBadge = ({ result }) => {
+  if (result?.resultStatus === 'Available') {
+    return (
+      <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700">
+        <FileText className="h-3.5 w-3.5" />
+        Result Available
+      </span>
+    )
+  }
+
+  return (
+    <span className="inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs font-semibold text-slate-500">
+      <FileText className="h-3.5 w-3.5" />
+      No result yet
+    </span>
+  )
+}
+
+const ResultValues = ({ values }) => {
+  if (!values) return null
+
+  if (Array.isArray(values)) {
+    return (
+      <div className="space-y-2">
+        {values.map((item, index) => {
+          const itemText = typeof item === 'object' ? JSON.stringify(item) : String(item)
+          return (
+            <div key={`${index}-${itemText.slice(0, 20)}`} className="rounded-xl bg-slate-50 px-3 py-2 text-sm text-slate-700">
+              {itemText}
+            </div>
+          )
+        })}
+      </div>
+    )
+  }
+
+  if (typeof values === 'object') {
+    return (
+      <div className="grid gap-2 sm:grid-cols-2">
+        {Object.entries(values).map(([key, value]) => (
+          <div key={key} className="rounded-xl border border-slate-100 bg-slate-50 px-3 py-2">
+            <div className="text-xs font-semibold uppercase text-slate-400">{key}</div>
+            <div className="break-words text-sm font-medium text-slate-700">
+              {typeof value === 'object' ? JSON.stringify(value) : String(value)}
+            </div>
+          </div>
+        ))}
+      </div>
+    )
+  }
+
+  return <p className="text-sm text-slate-700">{String(values)}</p>
+}
+
 const SkeletonCard = () => (
   <div className="animate-pulse bg-white rounded-2xl shadow-md overflow-hidden">
     <div className="bg-emerald-100 h-44" />
@@ -140,6 +226,9 @@ const Appointments = () => {
   const [loading,      setLoading]      = useState(false)
   const [error,        setError]        = useState(null)
   const [cancellingId, setCancellingId] = useState(null)
+  const [resultLoadingId, setResultLoadingId] = useState(null)
+  const [selectedResult, setSelectedResult] = useState(null)
+  const [resultError, setResultError] = useState('')
   const [navbarShowing, setNavbarShowing] = useState(true)
   const lastScrollY = useRef(0)
 
@@ -166,18 +255,39 @@ const Appointments = () => {
       const token   = await getToken()
       const headers = { Authorization: `Bearer ${token}` }
 
-      const [drRes, svcRes] = await Promise.all([
+      const [drRes, svcRes, resultRes] = await Promise.all([
         fetch(`${API_BASE}/api/appointments/me`,         { headers }),
         fetch(`${API_BASE}/api/service-appointments/me`, { headers }),
+        fetch(`${API_BASE}/api/my-service-results`,      { headers }),
       ])
 
-      const [drJson, svcJson] = await Promise.all([drRes.json(), svcRes.json()])
+      const [drJson, svcJson, resultJson] = await Promise.all([
+        drRes.json(),
+        svcRes.json(),
+        resultRes.json().catch(() => ({ success: false })),
+      ])
 
       if (!drJson.success)  throw new Error(drJson.message  || 'Failed to load doctor appointments')
       if (!svcJson.success) throw new Error(svcJson.message || 'Failed to load service appointments')
 
+      const availableResults = resultJson.success
+        ? (Array.isArray(resultJson.data) ? resultJson.data : resultJson.results || []).map(normalizeResultFromApi).filter(Boolean)
+        : []
+      const resultMap = new Map(
+        availableResults.map((result) => [result.serviceAppointmentId, result])
+      )
+      const serviceList = Array.isArray(svcJson.data) ? svcJson.data : []
+
       setDoctorAppts(Array.isArray(drJson.data)   ? drJson.data   : [])
-      setServiceAppts(Array.isArray(svcJson.data) ? svcJson.data  : [])
+      setServiceAppts(serviceList.map((appointment) => {
+        const appointmentId = appointment._id || appointment.id
+        const serviceResult = resultMap.get(appointmentId) || null
+        return {
+          ...appointment,
+          serviceResult,
+          hasAvailableResult: Boolean(serviceResult),
+        }
+      }))
     } catch (err) {
       setError(err.message || 'Unable to load appointments. Please try again.')
     } finally {
@@ -212,6 +322,46 @@ const Appointments = () => {
   }
 
   // ── Derived data ───────────────────────────────────────────────────────────────
+
+  const handleViewServiceResult = async (appointment) => {
+    const appointmentId = appointment._id || appointment.id
+    if (!appointmentId) return
+
+    setResultLoadingId(appointmentId)
+    setResultError('')
+
+    try {
+      const token = await getToken()
+      const res = await fetch(`${API_BASE}/api/my-service-appointments/${appointmentId}/result`, {
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      const json = await res.json().catch(() => ({}))
+
+      if (!res.ok || json.success === false) {
+        throw new Error(json.message || 'Unable to load this result.')
+      }
+
+      const result = normalizeResultFromApi(json.result || json.data)
+      if (!result) {
+        setResultError('Your result is not available yet.')
+        return
+      }
+
+      setSelectedResult({
+        appointment,
+        result,
+      })
+    } catch (err) {
+      setResultError(err.message || 'Unable to load this result.')
+    } finally {
+      setResultLoadingId(null)
+    }
+  }
+
+  const closeResultModal = () => {
+    setSelectedResult(null)
+    setResultError('')
+  }
 
   const filtered = useMemo(() => {
     const appts = activeTab === 'doctor' ? doctorAppts : serviceAppts
@@ -499,6 +649,19 @@ const Appointments = () => {
               )}
 
               {/* ── Appointments Grid ── */}
+              {resultError && (
+                <div className="mb-6 flex items-center gap-2 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
+                  <AlertCircle className="h-4 w-4 flex-shrink-0" />
+                  {resultError}
+                  <button
+                    onClick={() => setResultError('')}
+                    className="ml-auto text-xs font-semibold text-amber-800 hover:underline"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              )}
+
               {!loading && !error && filtered.length > 0 && (
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
                   {filtered.map((apt) => {
@@ -511,6 +674,9 @@ const Appointments = () => {
                     const title    = isDr ? (apt.doctorName  || 'Doctor')  : (apt.serviceName || 'Service')
                     const subtitle = isDr ? (apt.speciality  || 'Specialist') : null
                     const aptTime  = isDr ? (apt.time || 'N/A') : formatServiceTime(apt)
+                    const serviceResult = !isDr ? apt.serviceResult : null
+                    const hasAvailableResult = Boolean(serviceResult)
+                    const isResultLoading = resultLoadingId === aptId
 
                     return (
                       <article
@@ -598,6 +764,15 @@ const Appointments = () => {
                             <PaymentBadge payment={apt.payment} />
                           </div>
 
+                          {!isDr && (
+                            <div className="mt-0.5 space-y-2">
+                              <ResultStatusBadge result={serviceResult} />
+                              {!hasAvailableResult && (
+                                <p className="text-xs text-slate-400">Your result is not available yet.</p>
+                              )}
+                            </div>
+                          )}
+
                           {/* Rescheduled notice */}
                           {apt.status === 'Rescheduled' && apt.rescheduledTo && (
                             <div className="text-xs bg-blue-50 border border-blue-100 rounded-xl px-3 py-2 text-blue-700">
@@ -616,6 +791,21 @@ const Appointments = () => {
 
                           {/* Spacer */}
                           <div className="flex-1" />
+
+                          {!isDr && hasAvailableResult && (
+                            <div className="pt-3 border-t border-gray-100">
+                              <button
+                                onClick={() => handleViewServiceResult(apt)}
+                                disabled={isResultLoading}
+                                className="w-full inline-flex items-center justify-center gap-2 py-2.5 rounded-full text-sm font-semibold border border-emerald-200 text-emerald-700 hover:bg-emerald-50 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                              >
+                                {isResultLoading
+                                  ? <><RefreshCw className="w-4 h-4 animate-spin" /> Loading result...</>
+                                  : <><FileText className="w-4 h-4" /> View Result</>
+                                }
+                              </button>
+                            </div>
+                          )}
 
                           {/* ── Cancel action ── */}
                           {canCancel(apt) && (
@@ -666,6 +856,75 @@ const Appointments = () => {
             </section>
           )}
         </>
+      )}
+
+      {selectedResult && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4 py-6">
+          <div className="w-full max-w-2xl max-h-[90vh] overflow-y-auto rounded-2xl bg-white shadow-2xl border border-slate-100">
+            <div className="sticky top-0 z-10 flex items-start justify-between gap-4 border-b border-slate-100 bg-white px-6 py-4">
+              <div>
+                <h2 className="text-xl font-bold text-slate-900">
+                  {selectedResult.result.resultTitle || 'Service Test Result'}
+                </h2>
+                <p className="text-sm text-slate-500">
+                  {selectedResult.appointment.serviceName || 'Medical Service'}
+                </p>
+              </div>
+              <button
+                onClick={closeResultModal}
+                className="rounded-full p-2 text-slate-500 hover:bg-slate-100"
+                aria-label="Close result"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            <div className="space-y-5 px-6 py-5">
+              <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                This result is provided by the clinic/lab. Please consult your doctor for interpretation.
+              </div>
+
+              {selectedResult.result.resultSummary && (
+                <section>
+                  <h3 className="mb-2 text-sm font-bold text-slate-800">Summary</h3>
+                  <p className="whitespace-pre-wrap rounded-2xl bg-slate-50 px-4 py-3 text-sm leading-relaxed text-slate-700">
+                    {selectedResult.result.resultSummary}
+                  </p>
+                </section>
+              )}
+
+              {selectedResult.result.resultValues && (
+                <section>
+                  <h3 className="mb-2 text-sm font-bold text-slate-800">Result Values</h3>
+                  <ResultValues values={selectedResult.result.resultValues} />
+                </section>
+              )}
+
+              {selectedResult.result.resultFileUrl && (
+                <a
+                  href={selectedResult.result.resultFileUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-2 rounded-full border border-emerald-200 px-4 py-2 text-sm font-semibold text-emerald-700 hover:bg-emerald-50"
+                >
+                  <Download className="h-4 w-4" />
+                  View or Download File
+                </a>
+              )}
+
+              <div className="grid gap-3 border-t border-slate-100 pt-4 text-xs text-slate-500 sm:grid-cols-2">
+                <div>
+                  <span className="font-semibold text-slate-600">Created: </span>
+                  {formatDateTime(selectedResult.result.createdAt) || 'N/A'}
+                </div>
+                <div>
+                  <span className="font-semibold text-slate-600">Updated: </span>
+                  {formatDateTime(selectedResult.result.updatedAt) || 'N/A'}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
 
       <Footer />
