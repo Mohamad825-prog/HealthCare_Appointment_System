@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { useAuth, useUser } from '@clerk/clerk-react';
 import { serviceAppointmentsStyles } from '../assets/dummyStyles';
-import { Loader2, SearchIcon, XIcon, DollarSign, User, Phone, Calendar, Clock, CheckCircle, XCircle, CreditCard } from 'lucide-react';
+import { Loader2, SearchIcon, XIcon, DollarSign, User, Phone, Calendar, Clock, CheckCircle, XCircle, CreditCard, FileText, Upload, ExternalLink } from 'lucide-react';
 
 const API_BASE = "http://localhost:4000";
 // Helpers function
@@ -104,6 +104,8 @@ function mapServiceAppointment(a) {
         paymentMethod: payment.method || "Online",
         paymentStatus: payment.status || "Pending",
         paidAt: a.paidAt || payment.paidAt || null,
+        hasResult: Boolean(a.hasResult),
+        resultStatus: a.resultStatus || a.result_status || "",
         raw: a,
     };
 }
@@ -115,6 +117,51 @@ function paymentBadgeClasses(status) {
     if (normalized === "failed") return "bg-rose-50 text-rose-700 border-rose-100";
     if (normalized === "refunded") return "bg-slate-50 text-slate-700 border-slate-100";
     return "bg-amber-50 text-amber-700 border-amber-100";
+}
+
+const EMPTY_RESULT_FORM = {
+    resultTitle: "",
+    resultSummary: "",
+    resultValuesJson: "{}",
+    resultFileUrl: "",
+    resultStatus: "Draft",
+    resultFile: null,
+};
+
+function resultBadgeClasses(status) {
+    const normalized = String(status || "").toLowerCase();
+
+    if (normalized === "available") return "bg-emerald-50 text-emerald-700 border-emerald-100";
+    if (normalized === "draft") return "bg-amber-50 text-amber-700 border-amber-100";
+    if (normalized === "hidden") return "bg-slate-50 text-slate-700 border-slate-100";
+    return "bg-gray-50 text-gray-600 border-gray-100";
+}
+
+function normalizeResultFromApi(result) {
+    if (!result) return null;
+
+    return {
+        id: result.id || result._id || "",
+        serviceAppointmentId: result.serviceAppointmentId || result.service_appointment_id || "",
+        resultTitle: result.resultTitle || result.result_title || "",
+        resultSummary: result.resultSummary || result.result_summary || "",
+        resultValues: result.resultValues ?? result.result_values ?? null,
+        resultFileUrl: result.resultFileUrl || result.result_file_url || "",
+        resultFilePublicId: result.resultFilePublicId || result.result_file_public_id || "",
+        resultStatus: result.resultStatus || result.result_status || "Draft",
+        createdAt: result.createdAt || result.created_at || "",
+        updatedAt: result.updatedAt || result.updated_at || "",
+    };
+}
+
+function resultValuesToJson(values) {
+    if (!values) return "{}";
+
+    try {
+        return JSON.stringify(values, null, 2);
+    } catch {
+        return "{}";
+    }
 }
 
 // Status badge component
@@ -311,6 +358,15 @@ const ServiceAppointmentsPage = () => {
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
     const [markingPaymentId, setMarkingPaymentId] = useState("");
+    const [resultByAppointmentId, setResultByAppointmentId] = useState({});
+    const [resultEditor, setResultEditor] = useState({
+        open: false,
+        appointment: null,
+        loading: false,
+        saving: false,
+        error: "",
+        form: { ...EMPTY_RESULT_FORM },
+    });
 
     // Search & debounce
     const [search, setSearch] = useState("");
@@ -359,10 +415,12 @@ const ServiceAppointmentsPage = () => {
                 .map(mapServiceAppointment)
                 .filter(Boolean);
             setAppointments(normalized);
+            fetchResultsForAppointments(normalized);
         } catch (err) {
             console.error("fetchAppointments:", err);
             setError(err.message || "Failed to load appointments");
             setAppointments([]);
+            setResultByAppointmentId({});
         } finally {
             setLoading(false);
         }
@@ -382,8 +440,8 @@ const ServiceAppointmentsPage = () => {
         return body?.data || body?.appointment || body || {};
     }
 
-    async function getAdminHeaders() {
-        const headers = { "Content-Type": "application/json" };
+    async function getAdminHeaders({ json = true } = {}) {
+        const headers = json ? { "Content-Type": "application/json" } : {};
 
         try {
             const token = await getToken?.();
@@ -397,6 +455,35 @@ const ServiceAppointmentsPage = () => {
         }
 
         return headers;
+    }
+
+    async function fetchResultsForAppointments(list) {
+        if (!Array.isArray(list) || list.length === 0) {
+            setResultByAppointmentId({});
+            return;
+        }
+
+        try {
+            const headers = await getAdminHeaders();
+            const entries = await Promise.all(
+                list.map(async (appointment) => {
+                    try {
+                        const res = await fetch(`${API_BASE}/api/admin/service-appointments/${appointment.id}/result`, {
+                            headers,
+                        });
+                        const body = await res.json().catch(() => ({}));
+                        if (!res.ok || body?.success === false) return [appointment.id, null];
+                        return [appointment.id, normalizeResultFromApi(body.result || body.data)];
+                    } catch {
+                        return [appointment.id, null];
+                    }
+                })
+            );
+
+            setResultByAppointmentId(Object.fromEntries(entries));
+        } catch {
+            setResultByAppointmentId({});
+        }
     }
 
     async function markCashServicePaymentPaid(id) {
@@ -446,6 +533,245 @@ const ServiceAppointmentsPage = () => {
             pushToast("Payment update failed", err.message || "Failed to mark cash payment paid");
         } finally {
             setMarkingPaymentId("");
+        }
+    }
+
+    function setResultFormField(field, value) {
+        setResultEditor((prev) => ({
+            ...prev,
+            form: {
+                ...prev.form,
+                [field]: value,
+            },
+        }));
+    }
+
+    function closeResultEditor() {
+        setResultEditor({
+            open: false,
+            appointment: null,
+            loading: false,
+            saving: false,
+            error: "",
+            form: { ...EMPTY_RESULT_FORM },
+        });
+    }
+
+    async function openResultEditor(appointment) {
+        setResultEditor({
+            open: true,
+            appointment,
+            loading: true,
+            saving: false,
+            error: "",
+            form: {
+                ...EMPTY_RESULT_FORM,
+                resultTitle: `${appointment.serviceName || "Service"} Result`,
+            },
+        });
+
+        try {
+            const res = await fetch(`${API_BASE}/api/admin/service-appointments/${appointment.id}/result`, {
+                headers: await getAdminHeaders(),
+            });
+            const body = await res.json().catch(() => ({}));
+            if (!res.ok || body?.success === false) {
+                throw new Error(body?.message || `Failed to load result (${res.status})`);
+            }
+
+            const result = normalizeResultFromApi(body.result || body.data);
+            setResultByAppointmentId((prev) => ({ ...prev, [appointment.id]: result }));
+            setResultEditor((prev) => ({
+                ...prev,
+                loading: false,
+                form: result
+                    ? {
+                        resultTitle: result.resultTitle || `${appointment.serviceName || "Service"} Result`,
+                        resultSummary: result.resultSummary || "",
+                        resultValuesJson: resultValuesToJson(result.resultValues),
+                        resultFileUrl: result.resultFileUrl || "",
+                        resultStatus: result.resultStatus || "Draft",
+                        resultFile: null,
+                    }
+                    : {
+                        ...EMPTY_RESULT_FORM,
+                        resultTitle: `${appointment.serviceName || "Service"} Result`,
+                    },
+            }));
+        } catch (err) {
+            setResultEditor((prev) => ({
+                ...prev,
+                loading: false,
+                error: err.message || "Failed to load result",
+            }));
+        }
+    }
+
+    async function saveResultWithStatus(statusOverride = "Draft", { quiet = false } = {}) {
+        const appointment = resultEditor.appointment;
+        const form = resultEditor.form;
+        if (!appointment) return null;
+
+        const resultTitle = String(form.resultTitle || "").trim();
+        if (!resultTitle) {
+            setResultEditor((prev) => ({ ...prev, error: "Result Title is required." }));
+            return null;
+        }
+
+        const valuesText = String(form.resultValuesJson || "").trim();
+        if (valuesText) {
+            try {
+                JSON.parse(valuesText);
+            } catch {
+                setResultEditor((prev) => ({ ...prev, error: "Result Values must be valid JSON." }));
+                return null;
+            }
+        }
+
+        setResultEditor((prev) => ({ ...prev, saving: true, error: "" }));
+
+        try {
+            const payload = new FormData();
+            payload.append("result_title", resultTitle);
+            payload.append("result_summary", String(form.resultSummary || "").trim());
+            payload.append("result_values", valuesText || "");
+            payload.append("result_file_url", String(form.resultFileUrl || "").trim());
+            payload.append("result_status", statusOverride);
+            if (form.resultFile) {
+                payload.append("resultFile", form.resultFile);
+            }
+
+            const res = await fetch(`${API_BASE}/api/admin/service-appointments/${appointment.id}/result`, {
+                method: "PUT",
+                headers: await getAdminHeaders({ json: false }),
+                body: payload,
+            });
+            const body = await res.json().catch(() => ({}));
+            if (!res.ok || body?.success === false) {
+                throw new Error(body?.message || `Failed to save result (${res.status})`);
+            }
+
+            const result = normalizeResultFromApi(body.result || body.data);
+            setResultByAppointmentId((prev) => ({ ...prev, [appointment.id]: result }));
+            setResultEditor((prev) => ({
+                ...prev,
+                saving: false,
+                form: {
+                    ...prev.form,
+                    resultStatus: result?.resultStatus || statusOverride,
+                    resultFile: null,
+                    resultFileUrl: result?.resultFileUrl || prev.form.resultFileUrl,
+                },
+            }));
+
+            if (!quiet) {
+                pushToast("Result saved", `Result for appointment #${appointment.id} was saved as ${statusOverride}.`);
+            }
+
+            return result;
+        } catch (err) {
+            setResultEditor((prev) => ({
+                ...prev,
+                saving: false,
+                error: err.message || "Failed to save result",
+            }));
+            if (!quiet) {
+                pushToast("Result save failed", err.message || "Failed to save result");
+            }
+            return null;
+        }
+    }
+
+    async function publishCurrentResult() {
+        const appointment = resultEditor.appointment;
+        if (!appointment) return;
+
+        const paymentStatus = String(appointment.paymentStatus || "").toLowerCase();
+        if (paymentStatus !== "paid") {
+            const ok = window.confirm(
+                "This service payment is not marked Paid. Publish the result anyway? This will not change payment status."
+            );
+            if (!ok) return;
+        }
+
+        const saved = await saveResultWithStatus("Draft", { quiet: true });
+        if (!saved) return;
+
+        setResultEditor((prev) => ({ ...prev, saving: true, error: "" }));
+
+        try {
+            const res = await fetch(`${API_BASE}/api/admin/service-appointments/${appointment.id}/result/publish`, {
+                method: "PATCH",
+                headers: await getAdminHeaders(),
+            });
+            const body = await res.json().catch(() => ({}));
+            if (!res.ok || body?.success === false) {
+                throw new Error(body?.message || `Failed to publish result (${res.status})`);
+            }
+
+            const result = normalizeResultFromApi(body.result || body.data);
+            setResultByAppointmentId((prev) => ({ ...prev, [appointment.id]: result }));
+            setResultEditor((prev) => ({
+                ...prev,
+                saving: false,
+                form: {
+                    ...prev.form,
+                    resultStatus: "Available",
+                    resultFileUrl: result?.resultFileUrl || prev.form.resultFileUrl,
+                    resultFile: null,
+                },
+            }));
+            pushToast("Result published", `Result for appointment #${appointment.id} is now Available.`);
+        } catch (err) {
+            setResultEditor((prev) => ({
+                ...prev,
+                saving: false,
+                error: err.message || "Failed to publish result",
+            }));
+            pushToast("Publish failed", err.message || "Failed to publish result");
+        }
+    }
+
+    async function hideCurrentResult() {
+        const appointment = resultEditor.appointment;
+        if (!appointment) return;
+
+        const existingStatus = resultByAppointmentId[appointment.id]?.resultStatus || resultEditor.form.resultStatus || "Draft";
+        const saved = await saveResultWithStatus(existingStatus, { quiet: true });
+        if (!saved) return;
+
+        setResultEditor((prev) => ({ ...prev, saving: true, error: "" }));
+
+        try {
+            const res = await fetch(`${API_BASE}/api/admin/service-appointments/${appointment.id}/result/hide`, {
+                method: "PATCH",
+                headers: await getAdminHeaders(),
+            });
+            const body = await res.json().catch(() => ({}));
+            if (!res.ok || body?.success === false) {
+                throw new Error(body?.message || `Failed to hide result (${res.status})`);
+            }
+
+            const result = normalizeResultFromApi(body.result || body.data);
+            setResultByAppointmentId((prev) => ({ ...prev, [appointment.id]: result }));
+            setResultEditor((prev) => ({
+                ...prev,
+                saving: false,
+                form: {
+                    ...prev.form,
+                    resultStatus: "Hidden",
+                    resultFileUrl: result?.resultFileUrl || prev.form.resultFileUrl,
+                    resultFile: null,
+                },
+            }));
+            pushToast("Result hidden", `Result for appointment #${appointment.id} is now Hidden.`);
+        } catch (err) {
+            setResultEditor((prev) => ({
+                ...prev,
+                saving: false,
+                error: err.message || "Failed to hide result",
+            }));
+            pushToast("Hide failed", err.message || "Failed to hide result");
         }
     }
 
@@ -797,6 +1123,8 @@ const ServiceAppointmentsPage = () => {
                             const isCash = String(a.paymentMethod || "").toLowerCase() === "cash";
                             const isCashPending = isCash && (paymentStatusLower === "pending" || paymentStatusLower === "unpaid");
                             const isMarkingPayment = markingPaymentId === a.id;
+                            const result = resultByAppointmentId[a.id] || null;
+                            const resultStatusLabel = result?.resultStatus || "No Result";
                             return (
                                 <article key={a.id} className={serviceAppointmentsStyles.article}>
                                     <div className={serviceAppointmentsStyles.cardInner}>
@@ -855,6 +1183,13 @@ const ServiceAppointmentsPage = () => {
                                                 </div>
 
                                                 <div className={serviceAppointmentsStyles.detailItem}>
+                                                    <FileText className={serviceAppointmentsStyles.detailIcon} />
+                                                    <span className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs font-semibold ${resultBadgeClasses(result?.resultStatus)}`}>
+                                                        Result: {resultStatusLabel}
+                                                    </span>
+                                                </div>
+
+                                                <div className={serviceAppointmentsStyles.detailItem}>
                                                     <Calendar className={serviceAppointmentsStyles.detailIcon} />
                                                     <span className={serviceAppointmentsStyles.detailText}>
                                                         Date: {formatDateNice(a.date)}
@@ -879,7 +1214,17 @@ const ServiceAppointmentsPage = () => {
 
                                         <div className={serviceAppointmentsStyles.actionsContainer}>
                                             <div className={serviceAppointmentsStyles.actionsInnerContainer}>
-                                                <div className="flex-1">
+                                                <div>
+                                                    <button
+                                                        onClick={() => openResultEditor(a)}
+                                                        className="inline-flex h-10 shrink-0 items-center justify-center gap-2 whitespace-nowrap rounded-full bg-blue-50 px-3.5 text-sm font-semibold text-blue-700 transition hover:bg-blue-100 hover:shadow-sm"
+                                                    >
+                                                        <FileText className="h-4 w-4" />
+                                                        Result
+                                                    </button>
+                                                </div>
+
+                                                <div className="flex-none">
                                                     <RescheduleButton
                                                         appointment={a}
                                                         onReschedule={(d, t) =>
@@ -890,18 +1235,18 @@ const ServiceAppointmentsPage = () => {
                                                 </div>
 
                                                 {isCashPending && !isCanceled && (
-                                                    <div className="ml-3">
+                                                    <div className="flex-none">
                                                         <button
                                                             onClick={() => markCashServicePaymentPaid(a.id)}
                                                             disabled={Boolean(markingPaymentId)}
-                                                            className="px-3 py-2 rounded-full text-sm flex items-center gap-2 transition bg-emerald-50 text-emerald-700 hover:scale-105 disabled:opacity-60 disabled:cursor-not-allowed"
+                                                            className="inline-flex h-10 shrink-0 items-center justify-center gap-2 whitespace-nowrap rounded-full bg-emerald-50 px-3.5 text-sm font-semibold text-emerald-700 transition hover:bg-emerald-100 hover:shadow-sm disabled:cursor-not-allowed disabled:opacity-60"
                                                         >
                                                             {isMarkingPayment ? "Marking..." : "Mark Cash Paid"}
                                                         </button>
                                                     </div>
                                                 )}
 
-                                                <div className="ml-3">
+                                                <div className="flex-none">
                                                     <button
                                                         onClick={() => cancelRemote(a.id)}
                                                         disabled={isLocked}
@@ -920,6 +1265,158 @@ const ServiceAppointmentsPage = () => {
                             );
                         })
                     )}
+                </div>
+            )}
+
+            {resultEditor.open && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4 py-6">
+                    <div className="w-full max-w-3xl max-h-[90vh] overflow-y-auto rounded-2xl bg-white shadow-2xl border border-slate-100">
+                        <div className="sticky top-0 z-10 flex items-start justify-between gap-4 border-b border-slate-100 bg-white px-6 py-4">
+                            <div>
+                                <h2 className="text-xl font-bold text-slate-900">Service Test Result</h2>
+                                <p className="text-sm text-slate-500">
+                                    {resultEditor.appointment?.patientName} - {resultEditor.appointment?.serviceName}
+                                </p>
+                            </div>
+                            <button
+                                onClick={closeResultEditor}
+                                className="rounded-full p-2 text-slate-500 hover:bg-slate-100"
+                                aria-label="Close result editor"
+                            >
+                                <XIcon className="h-5 w-5" />
+                            </button>
+                        </div>
+
+                        {resultEditor.loading ? (
+                            <div className="flex items-center justify-center gap-3 px-6 py-12 text-slate-600">
+                                <Loader2 className="h-5 w-5 animate-spin" />
+                                Loading result...
+                            </div>
+                        ) : (
+                            <div className="space-y-5 px-6 py-5">
+                                {String(resultEditor.appointment?.paymentStatus || "").toLowerCase() !== "paid" && (
+                                    <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                                        Payment is currently {resultEditor.appointment?.paymentStatus || "Pending"}. Publishing a result will not update payment status.
+                                    </div>
+                                )}
+
+                                {resultEditor.error && (
+                                    <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+                                        {resultEditor.error}
+                                    </div>
+                                )}
+
+                                <div className="grid gap-4 sm:grid-cols-2">
+                                    <label className="space-y-1.5">
+                                        <span className="text-sm font-semibold text-slate-700">Result Title</span>
+                                        <input
+                                            value={resultEditor.form.resultTitle}
+                                            onChange={(e) => setResultFormField("resultTitle", e.target.value)}
+                                            className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100"
+                                            placeholder="Diabetes Test Result"
+                                        />
+                                    </label>
+
+                                    <label className="space-y-1.5">
+                                        <span className="text-sm font-semibold text-slate-700">Status</span>
+                                        <select
+                                            value={resultEditor.form.resultStatus}
+                                            onChange={(e) => setResultFormField("resultStatus", e.target.value)}
+                                            className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100"
+                                        >
+                                            <option value="Draft">Draft</option>
+                                            <option value="Available">Available</option>
+                                            <option value="Hidden">Hidden</option>
+                                        </select>
+                                    </label>
+                                </div>
+
+                                <label className="block space-y-1.5">
+                                    <span className="text-sm font-semibold text-slate-700">Result Summary</span>
+                                    <textarea
+                                        value={resultEditor.form.resultSummary}
+                                        onChange={(e) => setResultFormField("resultSummary", e.target.value)}
+                                        rows={4}
+                                        className="w-full resize-y rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100"
+                                        placeholder="Enter the clinic/lab summary exactly as provided."
+                                    />
+                                </label>
+
+                                <label className="block space-y-1.5">
+                                    <span className="text-sm font-semibold text-slate-700">Result Values JSON</span>
+                                    <textarea
+                                        value={resultEditor.form.resultValuesJson}
+                                        onChange={(e) => setResultFormField("resultValuesJson", e.target.value)}
+                                        rows={7}
+                                        spellCheck={false}
+                                        className="w-full resize-y rounded-xl border border-slate-200 px-3 py-2 font-mono text-xs outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100"
+                                        placeholder='{"fasting_glucose":"95 mg/dL"}'
+                                    />
+                                </label>
+
+                                <div className="grid gap-4 sm:grid-cols-2">
+                                    <label className="space-y-1.5">
+                                        <span className="text-sm font-semibold text-slate-700">Result File URL</span>
+                                        <input
+                                            value={resultEditor.form.resultFileUrl}
+                                            onChange={(e) => setResultFormField("resultFileUrl", e.target.value)}
+                                            className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100"
+                                            placeholder="https://..."
+                                        />
+                                    </label>
+
+                                    <label className="space-y-1.5">
+                                        <span className="text-sm font-semibold text-slate-700">Upload PDF/Image</span>
+                                        <div className="flex items-center gap-2 rounded-xl border border-dashed border-slate-300 px-3 py-2 text-sm text-slate-600">
+                                            <Upload className="h-4 w-4 text-slate-400" />
+                                            <input
+                                                type="file"
+                                                accept="application/pdf,image/png,image/jpeg,image/jpg,image/webp"
+                                                onChange={(e) => setResultFormField("resultFile", e.target.files?.[0] || null)}
+                                                className="min-w-0 flex-1 text-xs"
+                                            />
+                                        </div>
+                                    </label>
+                                </div>
+
+                                {resultEditor.form.resultFileUrl && (
+                                    <a
+                                        href={resultEditor.form.resultFileUrl}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        className="inline-flex items-center gap-2 text-sm font-semibold text-blue-700 hover:underline"
+                                    >
+                                        <ExternalLink className="h-4 w-4" />
+                                        Open current result file
+                                    </a>
+                                )}
+
+                                <div className="flex flex-col gap-3 border-t border-slate-100 pt-5 sm:flex-row sm:justify-end">
+                                    <button
+                                        onClick={() => saveResultWithStatus("Draft")}
+                                        disabled={resultEditor.saving}
+                                        className="rounded-full border border-amber-200 px-5 py-2.5 text-sm font-semibold text-amber-700 hover:bg-amber-50 disabled:opacity-60"
+                                    >
+                                        Save Draft
+                                    </button>
+                                    <button
+                                        onClick={hideCurrentResult}
+                                        disabled={resultEditor.saving}
+                                        className="rounded-full border border-slate-200 px-5 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-60"
+                                    >
+                                        Hide Result
+                                    </button>
+                                    <button
+                                        onClick={publishCurrentResult}
+                                        disabled={resultEditor.saving}
+                                        className="rounded-full bg-emerald-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-60"
+                                    >
+                                        {resultEditor.saving ? "Saving..." : "Publish Result"}
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+                    </div>
                 </div>
             )}
 

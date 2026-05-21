@@ -762,36 +762,36 @@ export const serviceAppointmentsStyles = {
   noResultsText: "text-sm text-gray-600",
   noResultsSubtext: "text-xs text-gray-400",
 
-  gridContainer: "grid grid-cols-1 sm:grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6 items-stretch",
+  gridContainer: "grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6 items-stretch",
 
   article: "group relative rounded-3xl p-1 animated-border h-full transform transition-all duration-300 hover:-translate-y-2",
   cardInner: "card-inner rounded-2xl overflow-hidden border-2 border-emerald-300/60 p-5 bg-white/90 shadow-lg h-full flex flex-col justify-between",
 
   cardHeader: "flex flex-col md:flex-row md:items-start md:justify-between gap-4",
-  patientInfoContainer: "flex items-start gap-4 min-w-0 flex-1",
+  patientInfoContainer: "flex items-start gap-4 min-w-0 flex-1 pr-2",
   patientAvatar: "rounded-full w-12 h-12 flex items-center justify-center bg-emerald-100/70",
   patientAvatarIcon: "h-6 w-6 text-emerald-700",
-  patientInfo: "min-w-0",
-  patientName: "text-base sm:text-lg font-bold leading-tight text-emerald-900 whitespace-nowrap",
+  patientInfo: "min-w-0 flex-1",
+  patientName: "text-base md:text-[17px] font-bold leading-snug text-emerald-900 whitespace-normal break-words",
   patientDetails: "text-sm text-gray-500 mt-1",
 
   statusContainer: "flex flex-col items-end gap-2 self-end w-auto mt-8 md:mt-0 ml-auto",
   detailStatusRow: "flex items-center justify-end md:justify-start",
 
   detailsContainer: "mt-4 flex flex-col gap-3 text-gray-700",
-  detailItem: "flex items-center gap-3 text-base",
-  detailIcon: "w-4 h-4 text-emerald-500",
-  detailText: "font-medium truncate",
+  detailItem: "flex min-w-0 flex-wrap items-center gap-2 text-sm sm:text-base",
+  detailIcon: "w-4 h-4 shrink-0 text-emerald-500",
+  detailText: "min-w-0 font-medium break-words",
   feesText: "font-semibold",
   serviceText: "mt-2 text-base text-gray-600",
   serviceName: "font-semibold text-emerald-800",
 
-  actionsContainer: "mt-4 flex items-center justify-between",
-  actionsInnerContainer: "flex items-center gap-2 w-full",
+  actionsContainer: "mt-5",
+  actionsInnerContainer: "flex flex-wrap items-center gap-2 w-full",
   cancelButton: (isLocked) =>
-    `px-3 py-1 rounded-full text-sm border ${isLocked
+    `inline-flex h-10 shrink-0 items-center justify-center whitespace-nowrap rounded-full border px-3.5 py-2 text-sm font-semibold transition ${isLocked
       ? "bg-gray-50 text-gray-400 border-gray-200 cursor-not-allowed"
-      : "bg-white text-rose-600 border-rose-200 hover:shadow-sm"
+      : "bg-white text-rose-600 border-rose-200 hover:bg-rose-50 hover:shadow-sm"
     }`,
 
   legendContainer: "mt-6 p-4 rounded-lg bg-white/80 shadow-inner border border-emerald-100 text-sm flex flex-col sm:flex-row flex-wrap items-center gap-4",
@@ -820,9 +820,9 @@ export const serviceAppointmentsStyles = {
 
   // RescheduleButton component styles
   rescheduleButton: (terminal) =>
-    `text-sm px-3 py-1 rounded-full cursor-pointer border transition ${terminal
+    `inline-flex h-10 shrink-0 items-center justify-center whitespace-nowrap rounded-full border px-3.5 py-2 text-sm font-semibold transition ${terminal
       ? "bg-gray-50 text-gray-400 border-gray-200 cursor-not-allowed"
-      : "bg-white text-emerald-800 border-emerald-400 hover:shadow-sm"
+      : "bg-white text-emerald-800 border-emerald-400 hover:bg-emerald-50 hover:shadow-sm"
     }`,
   rescheduleEditContainer: "flex flex-col sm:flex-row xl:flex-col md:flex-col md:items-end gap-2 bg-gray-50 p-2 rounded-md shadow-sm",
   rescheduleDateInput: "text-sm px-3 py-1 w-full sm:w-auto text-green-800 border border-emerald-500 rounded-full",
