@@ -12,6 +12,7 @@ import contactRouter from './routes/contactRouter.js';
 import aiRouter from './routes/aiRouter.js';
 import patientProfileRoutes from './routes/patientProfileRoutes.js';
 import adminRouter from './routes/adminRouter.js';
+import serviceTestResultRouter from './routes/serviceTestResultRoutes.js';
 
 const app = express();
 const port = 4000;
@@ -66,6 +67,7 @@ app.use("/api/doctors", doctorRouter);
 app.use("/api/services", serviceRouter);
 app.use("/api/appointments", appointmentRouter);
 app.use("/api/service-appointments", serviceAppointmentRouter);
+app.use("/api", serviceTestResultRouter);
 app.use("/api/contact", contactRouter);
 app.use("/api/patient/profile", patientProfileRoutes);
 app.use("/api/ai", aiRouter);

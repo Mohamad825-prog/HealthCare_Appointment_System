@@ -8,30 +8,30 @@ cloudinary.config({
     api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-// Function to upload an image to Cloudinary
-export async function uploadToCloudinary (filePath, folder="Doctor") {
+// Function to upload a file to Cloudinary
+export async function uploadToCloudinary(filePath, folder = "Doctor", resourceType = "image") {
     try {
         const result = await cloudinary.uploader.upload(filePath, {
             folder,
-            resource_type: "image"
+            resource_type: resourceType,
         });
 
-        // Delete the local file after uploading
-        fs.unlinkSync(filePath);
         return result;
-    }
-
-        catch (err) {
-            console.error("Cloudinary upload error:", err);
-            throw err;
+    } catch (err) {
+        console.error("Cloudinary upload error:", err);
+        throw err;
+    } finally {
+        if (filePath && fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
         }
+    }
 }
 
-// Function to delete an image from Cloudinary
-export async function deleteFromCloudinary(publicId) {
+// Function to delete an asset from Cloudinary
+export async function deleteFromCloudinary(publicId, resourceType = "image") {
     try {
         if (!publicId) return;
-        await cloudinary.uploader.destroy(publicId);
+        await cloudinary.uploader.destroy(publicId, { resource_type: resourceType });
     }
 
     catch (err) {

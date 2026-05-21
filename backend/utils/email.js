@@ -432,6 +432,29 @@ export async function sendServiceAppointmentCreatedEmail({
     });
 }
 
+export async function sendServiceTestResultAvailableEmail({
+    to,
+    patientName,
+    serviceName,
+    resultTitle,
+}) {
+    const title = "Your Service Test Result Is Available";
+    const intro = "Your clinic or lab has made a service test result available in your account.";
+    const details = [
+        ["Patient Name", patientName],
+        ["Service", serviceName],
+        ["Result", resultTitle],
+    ];
+    const closing = "Please log in to your account to view the result. The medical result is not included in this email for privacy.";
+
+    return sendEmail({
+        to,
+        subject: title,
+        html: renderEmailHtml({ title, intro, details, closing }),
+        text: renderEmailText({ title, intro, details, closing }),
+    });
+}
+
 export async function sendContactNotificationEmail({
     to,
     name,
